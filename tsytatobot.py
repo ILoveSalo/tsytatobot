@@ -9,11 +9,13 @@ from telebot import custom_filters
 from telebot.states.sync.middleware import StateMiddleware
 from telebot import types
 
+from date_parser.date_parser import DateParser
 from domain.phrase import Phrase
 from domain.quote import Quote
 from domain.speaker import Speaker
 from persistence.impl.local_files.json.json_speaker_repository import JsonSpeakerRepository
 from persistence.speaker_repository import SpeakerRepository
+from quote_generator.quote_text_generator import QuoteTextGenerator
 
 # ------------------ Infrastructure ------------------
 
@@ -42,6 +44,8 @@ bot.setup_middleware(StateMiddleware(bot))              # enables state transiti
 # Repository for saving/retrieving speakers
 speaker_repository: SpeakerRepository = JsonSpeakerRepository("speakers.json")
 
+date_parser = DateParser()
+quote_text_generator = QuoteTextGenerator(date_parser)
 
 # ------------------ States ------------------
 
@@ -62,40 +66,10 @@ class SpeakerState(StatesGroup):
 
 # ------------------ Utils ------------------
 
-# Convert user input → datetime
-def parse_string_to_date(date: str):
-    if date.lower().strip() in ("today", "📅 today"):
-        return datetime.today()
-    return datetime.strptime(date, "%d.%m.%Y")
-
-# Convert datetime → "dd.mm.yyyy"
-def parse_date_to_string(date: datetime):
-    return date.strftime('%d.%m.%Y')
-
 # Retrieve Quote object from current user’s state
 def get_quote_from_state(user_id, chat_id):
     with bot.retrieve_data(user_id, chat_id) as data:
         return data.get("quote")
-
-# Collect unique speaker names in a quote
-def get_unique_names(quote: Quote):
-    return {phrase.speaker.name for phrase in quote.phrases}
-
-# Generate hashtags for all speakers in a quote
-def generate_tags(quote: Quote):
-    return " ".join(f"#{speaker}" for speaker in get_unique_names(quote))
-
-# Format quote text for preview/posting
-def generate_quote(quote: Quote):
-    if len(quote.phrases) == 1:
-        # Single phrase → "text" - speaker, date + tags
-        return (f"\"{quote.phrases[0].text}\" - {quote.phrases[0].speaker.name}, {parse_date_to_string(quote.date)}\n"
-                f"{generate_tags(quote)}")
-
-    # Multiple phrases → dialogue format
-    result = "".join(f"{phrase.speaker.name}: {phrase.text}\n" for phrase in quote.phrases)
-    result += f"{parse_date_to_string(quote.date)}\n{generate_tags(quote)}"
-    return result
 
 
 # ------------------ Handlers ------------------
@@ -124,7 +98,7 @@ def create_quote(message):
 @bot.message_handler(state=QuoteState.waiting_for_date)
 def process_quote_date(message):
     try:
-        date = parse_string_to_date(message.text)
+        date = date_parser.parse_string_to_date(message.text)
     except:
         bot.reply_to(message, "That doesn’t look like a valid date. Example: 25.06.2005. Try again.")
         bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
@@ -134,7 +108,7 @@ def process_quote_date(message):
     bot.add_data(message.from_user.id, message.chat.id, quote=Quote([], date))
 
     # Ask for first phrase
-    bot.send_message(message.chat.id, f"Cool! So, what was said on {parse_date_to_string(date)}?")
+    bot.send_message(message.chat.id, f"Cool! So, what was said on {date_parser.parse_date_to_string(date)}?")
     bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
 
 
@@ -182,7 +156,7 @@ def process_speaker_name(message):
 
     # Show preview
     bot.send_message(message.chat.id, f"Did {name} really say that??? (¬_¬\")\nYour phrase is:")
-    bot.send_message(message.chat.id, generate_quote(quote))
+    bot.send_message(message.chat.id, quote_text_generator.generate_quote_with_tags(quote))
 
     # Offer choices: add, finalize, cancel
     keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
@@ -198,7 +172,7 @@ def process_next_step_finalize_option(message):
     quote = get_quote_from_state(message.from_user.id, message.chat.id)
 
     # Post final quote to channel
-    bot.send_message(CHANNEL_ID, generate_quote(quote))
+    bot.send_message(CHANNEL_ID, quote_text_generator.generate_quote_with_tags(quote))
     bot.send_message(message.chat.id, "Done! (⸝⸝> ᴗ•⸝⸝)")
     bot.delete_state(message.from_user.id, message.chat.id)
 
