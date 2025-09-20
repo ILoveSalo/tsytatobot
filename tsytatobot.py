@@ -7,6 +7,7 @@ from telebot.handler_backends import State, StatesGroup
 from telebot.storage import StateMemoryStorage
 from telebot import custom_filters
 from telebot.states.sync.middleware import StateMiddleware
+from telebot import types
 
 from domain.phrase import Phrase
 from domain.quote import Quote
@@ -59,7 +60,7 @@ class SpeakerState(StatesGroup):
 
 # Convert string (like "today" or "25.06.2005") → datetime
 def parse_string_to_date(date: str):
-    if date == "today":
+    if date.lower().strip() == "today" or date.lower().strip() == "📅 today":
         return datetime.today()
     return datetime.strptime(date, "%d.%m.%Y")
 
@@ -107,7 +108,15 @@ def generate_quote(quote: Quote):
 @bot.message_handler(commands=['quote'])
 def create_quote(message):
     bot.reply_to(message, "Nice! Let's create a new quote!")
-    bot.send_message(message.chat.id, "Let's start with the date. When did you hear these words? (dd.mm.yyyy or today)")
+
+    # Create a keyboard
+    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
+    # Add buttons
+    answers = ["📅 Today"]
+    buttons = [types.KeyboardButton(answer) for answer in answers]
+    keyboard.add(*buttons)
+
+    bot.send_message(message.chat.id, "Let's start with the date. When did you hear these words? (dd.mm.yyyy or today)", reply_markup=keyboard)
     # Move state machine → waiting for date
     bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
 
@@ -172,8 +181,15 @@ def process_speaker_name(message):
     )
     bot.send_message(message.chat.id, generate_quote(quote))
 
+    # Create a keyboard
+    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
+    # Add buttons
+    answers = ["➕ Add", "✔️ Finalize"]
+    buttons = [types.KeyboardButton(answer) for answer in answers]
+    keyboard.add(*buttons)
+
     # Offer choices
-    bot.send_message(message.chat.id, "Do you want to add a new phrase or finalize the quote?")
+    bot.send_message(message.chat.id, "Do you want to add a new phrase or finalize the quote?", reply_markup=keyboard)
 
 
 # Step 4: next step choice → add another phrase OR finalize
@@ -182,7 +198,7 @@ def process_next_step(message):
     next_step = message.text
     quote = get_quote_from_state(message.from_user.id, message.chat.id)
 
-    if next_step.lower().strip() == "finalize":
+    if next_step.lower().strip() == "finalize" or next_step.lower().strip() == "✔️ finalize":
         # Send final quote to channel
         bot.send_message(CHANNEL_ID, generate_quote(quote))
         bot.send_message(message.chat.id, "Done! (⸝⸝> ᴗ•⸝⸝)")
@@ -190,7 +206,7 @@ def process_next_step(message):
         bot.delete_state(message.from_user.id, message.chat.id)
         return
 
-    if next_step.lower().strip() != "add":
+    if next_step.lower().strip() != "add" and next_step.lower().strip() != "➕ add":
         # Invalid option → re-ask
         bot.reply_to(message, "I don't know what to do with that. Let's try again.")
         bot.send_message(message.chat.id, "Do you want to add a new phrase or finalize the quote?")
