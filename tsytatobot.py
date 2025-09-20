@@ -12,7 +12,8 @@ from telebot import types
 from domain.phrase import Phrase
 from domain.quote import Quote
 from domain.speaker import Speaker
-
+from persistence.impl.local_files.json.json_speaker_repository import JsonSpeakerRepository
+from persistence.speaker_repository import SpeakerRepository
 
 # ------------------ Infrastructure ------------------
 
@@ -37,6 +38,9 @@ storage = StateMemoryStorage()
 bot = telebot.TeleBot(BOT_TOKEN, state_storage=storage, use_class_middlewares=True)
 bot.add_custom_filter(custom_filters.StateFilter(bot))  # allow @message_handler(state=...) decorators
 bot.setup_middleware(StateMiddleware(bot))              # middleware for state transitions
+
+#Initialize speaker repository
+speaker_repository: SpeakerRepository = JsonSpeakerRepository("speakers.json")
 
 
 # ------------------ States ------------------
@@ -73,13 +77,17 @@ def get_quote_from_state(user_id, chat_id):
     with bot.retrieve_data(user_id, chat_id) as data:
         return data.get("quote")
 
-# Generate hashtags from all speakers in a quote
-def generate_tags(quote: Quote):
-    result = ""
+def get_unique_names(quote: Quote):
     used_speakers = set()
     for phrase in quote.phrases:
         name = phrase.speaker.name
         used_speakers.add(name)
+    return used_speakers
+
+# Generate hashtags from all speakers in a quote
+def generate_tags(quote: Quote):
+    result = ""
+    used_speakers = get_unique_names(quote)
 
     for speaker in used_speakers:
         result += f"#{speaker} "
@@ -153,10 +161,24 @@ def process_phrase_text(message):
     # Next state → waiting for speaker name
     bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
 
+    #Get known speakers
+    speakers = speaker_repository.get_speakers()
+    answers = list()
+    for speaker in speakers:
+        answers.append(speaker.name)
+
+    # Create a keyboard
+    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
+    # Add buttons
+    buttons = [types.KeyboardButton(answer) for answer in answers]
+    keyboard.add(*buttons)
+
+
     bot.send_message(
         message.chat.id,
         f"\"{text}\", such wise words! ദ്ദി(˵ •̀ ᴗ - ˵ ) ✧\n"
-        f"Now, who is the wise person that said this?"
+        f"Now, who is the wise person that said this?",
+        reply_markup=keyboard
     )
 
 
@@ -169,6 +191,9 @@ def process_speaker_name(message):
     # Attach speaker to last phrase
     quote.phrases[-1].speaker = Speaker(name)
     bot.add_data(message.from_user.id, message.chat.id, quote=quote)
+
+    #Save speaker for future use
+    speaker_repository.save_speaker(quote.phrases[-1].speaker)
 
     # Next state → ask user what to do next
     bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
