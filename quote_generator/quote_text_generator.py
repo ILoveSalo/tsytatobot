@@ -21,7 +21,7 @@ class QuoteTextGenerator:
 
         # Multiple phrases → dialogue format
         result = "".join(f"{phrase.speaker.name}: {phrase.text}\n" for phrase in quote.phrases)
-        result += f"{self.date_parser.parse_date_to_string(quote.date)}"
+        result += f"{self.date_parser.parse_date_to_string(quote.date)}\n"
         return result
 
     def generate_quote_with_tags(self, quote: Quote):

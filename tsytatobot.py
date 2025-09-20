@@ -1,5 +1,4 @@
 import os
-from datetime import datetime
 
 from dotenv import load_dotenv
 import telebot
@@ -13,6 +12,7 @@ from date_parser.date_parser import DateParser
 from domain.phrase import Phrase
 from domain.quote import Quote
 from domain.speaker import Speaker
+from quote_generator.quote_image_generator import QuoteImageGenerator
 from persistence.impl.local_files.json.json_speaker_repository import JsonSpeakerRepository
 from persistence.speaker_repository import SpeakerRepository
 from quote_generator.quote_text_generator import QuoteTextGenerator
@@ -46,6 +46,7 @@ speaker_repository: SpeakerRepository = JsonSpeakerRepository("speakers.json")
 
 date_parser = DateParser()
 quote_text_generator = QuoteTextGenerator(date_parser)
+quote_image_generator = QuoteImageGenerator(quote_text_generator)
 
 # ------------------ States ------------------
 
@@ -154,9 +155,13 @@ def process_speaker_name(message):
     # Move to "what next?" state
     bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
 
+    image = quote_image_generator.generate_quote_image(quote)
+    quote_text = quote_text_generator.generate_quote_with_tags(quote)
+
     # Show preview
     bot.send_message(message.chat.id, f"Did {name} really say that??? (¬_¬\")\nYour phrase is:")
-    bot.send_message(message.chat.id, quote_text_generator.generate_quote_with_tags(quote))
+    bot.send_photo(message.chat.id, photo=image, caption=quote_text)
+    #bot.send_message(message.chat.id, quote_text_generator.generate_quote_with_tags(quote))
 
     # Offer choices: add, finalize, cancel
     keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
@@ -171,8 +176,12 @@ def process_speaker_name(message):
 def process_next_step_finalize_option(message):
     quote = get_quote_from_state(message.from_user.id, message.chat.id)
 
+    image = quote_image_generator.generate_quote_image(quote)
+    quote_text = quote_text_generator.generate_quote_with_tags(quote)
+
     # Post final quote to channel
-    bot.send_message(CHANNEL_ID, quote_text_generator.generate_quote_with_tags(quote))
+    #bot.send_message(CHANNEL_ID, quote_text_generator.generate_quote_with_tags(quote))
+    bot.send_photo(CHANNEL_ID, photo=image, caption=quote_text)
     bot.send_message(message.chat.id, "Done! (⸝⸝> ᴗ•⸝⸝)")
     bot.delete_state(message.from_user.id, message.chat.id)
 
