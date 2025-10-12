@@ -14,18 +14,30 @@ class QuoteTextGenerator:
         return " ".join(f"#{speaker}" for speaker in self.get_unique_names(quote))
 
     def generate_quote(self, quote: Quote):
-        """Format quote text for preview/posting"""
         if len(quote.phrases) == 1:
             # Single phrase → "text" - speaker, date + tags
-            return f"\"{quote.phrases[0].text}\" - {quote.phrases[0].speaker.name}, {self.date_parser.parse_date_to_string(quote.date)}\n"
+            return f"{quote.phrases[0].text}"
 
         # Multiple phrases → dialogue format
         result = "".join(f"{phrase.speaker.name}: {phrase.text}\n" for phrase in quote.phrases)
+        result += "\n"
+        return result
+
+    def generate_quote_with_name(self, quote: Quote):
+        if len(quote.phrases) == 1:
+            # Single phrase → "text" - speaker, date + tags
+            return f"\"{self.generate_quote(quote)}\" - {quote.phrases[0].speaker.name}, "
+
+        return self.generate_quote(quote)
+
+    def generate_quote_with_date(self, quote: Quote):
+        """Format quote text for preview/posting"""
+        result = self.generate_quote_with_name(quote)
         result += f"{self.date_parser.parse_date_to_string(quote.date)}\n"
         return result
 
     def generate_quote_with_tags(self, quote: Quote):
         """Generate quote text with tags"""
-        result = self.generate_quote(quote)
+        result = self.generate_quote_with_date(quote)
         result += f"\n{self.generate_tags(quote)}"
         return result

@@ -6,12 +6,16 @@ from persistence.speaker_repository import SpeakerRepository
 class JsonSpeakerRepository(SpeakerRepository):
     def __init__(self, file_path: str):
         self.file_path = file_path
-        # Load existing speakers, or create empty list if file missing
         if os.path.exists(self.file_path):
             with open(self.file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # convert dicts to Speaker objects
-                self.speakers = [Speaker(item["name"]) for item in data]
+                try:
+                    data = json.load(f)
+                    self.speakers = [
+                        Speaker(item["name"], item.get("speaker_image_id"))
+                        for item in data
+                    ]
+                except json.JSONDecodeError:
+                    self.speakers = []
         else:
             self.speakers = []
 
@@ -21,12 +25,26 @@ class JsonSpeakerRepository(SpeakerRepository):
 
     def save_speaker(self, speaker: Speaker):
         """Add a speaker if not already present, and save to JSON file."""
-        # Check if speaker already exists
-        if any(s.name == speaker.name for s in self.speakers):
-            return  # already exists, do nothing
+        existing = next((s for s in self.speakers if s.name == speaker.name), None)
 
-        # Add speaker to list
-        self.speakers.append(speaker)
-        # Save updated list to JSON
+        if existing:
+            # update image if it’s new
+            if speaker.speaker_image_id and existing.speaker_image_id != speaker.speaker_image_id:
+                existing.speaker_image_id = speaker.speaker_image_id
+        else:
+            self.speakers.append(speaker)
+
         with open(self.file_path, "w", encoding="utf-8") as f:
-            json.dump([{"name": s.name} for s in self.speakers], f, ensure_ascii=False, indent=2)
+            json.dump(
+                [
+                    {"name": s.name, "speaker_image_id": s.speaker_image_id}
+                    for s in self.speakers
+                ],
+                f,
+                ensure_ascii=False,
+                indent=2
+            )
+
+    def get_speaker(self, name: str) -> Speaker | None:
+        """Return the Speaker object with the given name, or None if not found."""
+        return next((s for s in self.speakers if s.name == name), None)

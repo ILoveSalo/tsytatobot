@@ -6,3 +6,6 @@ class SpeakerRepository:
 
     def save_speaker(self, speaker: Speaker):
         pass
+
+    def get_speaker(self, name: str):
+        pass
