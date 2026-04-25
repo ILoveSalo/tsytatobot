@@ -15,3 +15,7 @@ class SpeakerRepository(ABC):
     @abstractmethod
     def get_speaker(self, name: str, chat_id: int | None = None) -> Speaker | None:
         raise NotImplementedError
+
+    @abstractmethod
+    def rename_speaker(self, old_name: str, new_name: str, chat_id: int | None = None) -> Speaker | None:
+        raise NotImplementedError

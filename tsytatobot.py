@@ -59,6 +59,7 @@ sticker_file_cache: dict[str, bytes] = {}
 
 class QuoteState(StatesGroup):
     waiting_for_date = State()
+    waiting_for_phrase_image_selection = State()
     waiting_for_context_decision = State()
     waiting_for_main_speaker = State()
     waiting_for_next_step = State()
@@ -72,15 +73,20 @@ class PhraseState(StatesGroup):
 
 class SpeakerState(StatesGroup):
     waiting_for_name = State()
-    waiting_for_if_add_image_answer = State()
-    waiting_for_speaker_image = State()
+
+
+class SpeakerEditState(StatesGroup):
+    waiting_for_speaker_name = State()
+    waiting_for_action = State()
+    waiting_for_new_name = State()
+    waiting_for_new_image = State()
 
 
 # ------------------ Callback data ------------------
 
 DATE_TODAY = "quote:date:today"
-ADD_IMAGE_YES = "quote:add_image:yes"
-ADD_IMAGE_NO = "quote:add_image:no"
+PHRASE_IMAGE_PREFIX = "quote:phrase_image:"
+PHRASE_IMAGE_NONE = "quote:phrase_image:none"
 ADD_CONTEXT_YES = "quote:add_context:yes"
 ADD_CONTEXT_NO = "quote:add_context:no"
 MAIN_SELECT_PREFIX = "quote:main:"
@@ -88,6 +94,14 @@ NEXT_ADD = "quote:next:add"
 NEXT_MAIN = "quote:next:main"
 NEXT_FINALIZE = "quote:next:finalize"
 NEXT_CANCEL = "quote:next:cancel"
+
+EDIT_ACTION_RENAME = "edit_speaker:action:rename"
+EDIT_ACTION_ADD_IMAGE = "edit_speaker:action:add_image"
+EDIT_ACTION_SET_PRIMARY = "edit_speaker:action:set_primary"
+EDIT_ACTION_REMOVE_IMAGE = "edit_speaker:action:remove_image"
+EDIT_ACTION_DONE = "edit_speaker:action:done"
+EDIT_SET_PRIMARY_PREFIX = "edit_speaker:set_primary:"
+EDIT_REMOVE_IMAGE_PREFIX = "edit_speaker:remove_image:"
 
 
 # ------------------ Utils ------------------
@@ -105,6 +119,27 @@ def get_quote_from_state(user_id: int, chat_id: int) -> Quote | None:
 
 def set_quote_to_state(user_id: int, chat_id: int, quote: Quote) -> None:
     bot.add_data(user_id, chat_id, quote=quote)
+
+
+def clear_edit_speaker_state_data(user_id: int, chat_id: int) -> None:
+    with bot.retrieve_data(user_id, chat_id) as data:
+        data.pop("edit_speaker_name", None)
+
+
+def set_edit_speaker_name_to_state(user_id: int, chat_id: int, speaker_name: str) -> None:
+    bot.add_data(user_id, chat_id, edit_speaker_name=speaker_name)
+
+
+def get_edit_speaker_name_from_state(user_id: int, chat_id: int) -> str | None:
+    with bot.retrieve_data(user_id, chat_id) as data:
+        return data.get("edit_speaker_name")
+
+
+def get_edit_speaker_from_state(user_id: int, chat_id: int) -> Speaker | None:
+    speaker_name = get_edit_speaker_name_from_state(user_id, chat_id)
+    if not speaker_name:
+        return None
+    return speaker_repository.get_speaker(speaker_name, chat_id=chat_id)
 
 
 def get_speaker_display_name_from_user(user: types.User) -> str:
@@ -160,8 +195,9 @@ def build_quote_signature(quote: Quote) -> tuple:
         (
             phrase.text,
             phrase.context_text,
+            phrase.speaker_image_id,
             phrase.speaker.name if phrase.speaker else None,
-            phrase.speaker.speaker_image_id if phrase.speaker else None,
+            tuple(phrase.speaker.speaker_image_ids) if phrase.speaker else tuple(),
         )
         for phrase in quote.phrases
     )
@@ -178,10 +214,13 @@ def bytes_to_image_io(image_bytes: bytes, name: str = "quote.png") -> io.BytesIO
 def download_sticker_images_for_quote(quote: Quote) -> dict[str, bytes]:
     indexed_images: dict[str, bytes] = {}
     for phrase in quote.phrases:
-        if not phrase.speaker or not phrase.speaker.speaker_image_id:
+        if not phrase.speaker:
             continue
 
-        file_id = phrase.speaker.speaker_image_id
+        file_id = phrase.speaker_image_id or phrase.speaker.speaker_image_id
+        if not file_id:
+            continue
+
         if file_id in indexed_images:
             continue
 
@@ -261,12 +300,11 @@ def build_date_keyboard() -> types.InlineKeyboardMarkup:
     return keyboard
 
 
-def build_add_image_keyboard() -> types.InlineKeyboardMarkup:
+def build_phrase_image_keyboard(speaker: Speaker) -> types.InlineKeyboardMarkup:
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton("Yes", callback_data=ADD_IMAGE_YES),
-        types.InlineKeyboardButton("No", callback_data=ADD_IMAGE_NO),
-    )
+    for index, _ in enumerate(speaker.speaker_image_ids):
+        keyboard.add(types.InlineKeyboardButton(f"Image {index + 1}", callback_data=f"{PHRASE_IMAGE_PREFIX}{index}"))
+    keyboard.add(types.InlineKeyboardButton("No image", callback_data=PHRASE_IMAGE_NONE))
     return keyboard
 
 
@@ -276,6 +314,33 @@ def build_add_context_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("Add context", callback_data=ADD_CONTEXT_YES),
         types.InlineKeyboardButton("Skip", callback_data=ADD_CONTEXT_NO),
     )
+    return keyboard
+
+
+def build_edit_speaker_actions_keyboard(speaker: Speaker) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("Rename", callback_data=EDIT_ACTION_RENAME),
+        types.InlineKeyboardButton("Add image", callback_data=EDIT_ACTION_ADD_IMAGE),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton("Set primary", callback_data=EDIT_ACTION_SET_PRIMARY),
+        types.InlineKeyboardButton("Remove image", callback_data=EDIT_ACTION_REMOVE_IMAGE),
+    )
+    keyboard.add(types.InlineKeyboardButton("Done", callback_data=EDIT_ACTION_DONE))
+    return keyboard
+
+
+def build_edit_speaker_image_keyboard(speaker: Speaker, callback_prefix: str) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if not speaker.speaker_image_ids:
+        return keyboard
+
+    for index, _ in enumerate(speaker.speaker_image_ids):
+        label = f"Image {index + 1}"
+        if index == 0:
+            label = f"⭐ {label}"
+        keyboard.add(types.InlineKeyboardButton(label, callback_data=f"{callback_prefix}{index}"))
     return keyboard
 
 
@@ -318,6 +383,49 @@ def prompt_context_for_last_phrase(user_id: int, chat_id: int) -> None:
     )
 
 
+def prompt_phrase_image_for_last_phrase(user_id: int, chat_id: int) -> None:
+    quote = ensure_quote_exists_for_session(user_id, chat_id)
+    if quote is None or not quote.phrases:
+        return
+
+    phrase = quote.phrases[-1]
+    speaker = phrase.speaker
+    if speaker is None:
+        prompt_context_for_last_phrase(user_id, chat_id)
+        return
+
+    if not speaker.speaker_image_ids:
+        phrase.speaker_image_id = None
+        set_quote_to_state(user_id, chat_id, quote)
+        reset_render_cache(user_id, chat_id)
+        prompt_context_for_last_phrase(user_id, chat_id)
+        return
+
+    if phrase.speaker_image_id not in speaker.speaker_image_ids:
+        phrase.speaker_image_id = speaker.speaker_image_ids[0]
+        set_quote_to_state(user_id, chat_id, quote)
+        reset_render_cache(user_id, chat_id)
+
+    bot.set_state(user_id, QuoteState.waiting_for_phrase_image_selection, chat_id)
+    safe_send_message(
+        chat_id,
+        f"Choose image for {speaker.name} in this phrase:",
+        reply_markup=build_phrase_image_keyboard(speaker),
+    )
+
+
+def prompt_edit_speaker_actions(user_id: int, chat_id: int, speaker: Speaker) -> None:
+    set_edit_speaker_name_to_state(user_id, chat_id, speaker.name)
+    bot.set_state(user_id, SpeakerEditState.waiting_for_action, chat_id)
+
+    images_count = len(speaker.speaker_image_ids)
+    safe_send_message(
+        chat_id,
+        f"Editing speaker: {speaker.name}\nImages: {images_count}",
+        reply_markup=build_edit_speaker_actions_keyboard(speaker),
+    )
+
+
 def continue_after_speaker_set(message: types.Message) -> None:
     user_id = message.from_user.id
     chat_id = message.chat.id
@@ -331,19 +439,7 @@ def continue_after_speaker_set(message: types.Message) -> None:
         bot.set_state(user_id, SpeakerState.waiting_for_name, chat_id)
         return
 
-    bot.set_state(user_id, SpeakerState.waiting_for_if_add_image_answer, chat_id)
-    if speaker.speaker_image_id is None:
-        safe_send_message(
-            chat_id,
-            f"{speaker.name} has no sticker image yet. Add one?",
-            reply_markup=build_add_image_keyboard(),
-        )
-    else:
-        safe_send_message(
-            chat_id,
-            f"{speaker.name} already has a sticker image. Replace it?",
-            reply_markup=build_add_image_keyboard(),
-        )
+    prompt_phrase_image_for_last_phrase(user_id, chat_id)
 
 
 def process_speaker_name_end(user_id: int, chat_id: int) -> None:
@@ -516,57 +612,299 @@ def process_speaker_name_non_text(message: types.Message):
     safe_send_message(message.chat.id, "Please send the speaker name as text.")
 
 
-@bot.callback_query_handler(func=lambda call: call.data in (ADD_IMAGE_YES, ADD_IMAGE_NO))
-def process_add_image_callback(call: types.CallbackQuery):
+@bot.message_handler(commands=["edit_speaker"], state="*")
+def process_edit_speaker_command(message: types.Message):
+    clear_edit_speaker_state_data(message.from_user.id, message.chat.id)
+
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) == 2 and command_parts[1].strip():
+        speaker_name = command_parts[1].strip()
+        speaker = speaker_repository.get_speaker(speaker_name, chat_id=message.chat.id)
+        if speaker is None:
+            safe_send_message(message.chat.id, f"Speaker '{speaker_name}' not found.")
+            bot.set_state(message.from_user.id, SpeakerEditState.waiting_for_speaker_name, message.chat.id)
+            return
+        prompt_edit_speaker_actions(message.from_user.id, message.chat.id, speaker)
+        return
+
+    bot.set_state(message.from_user.id, SpeakerEditState.waiting_for_speaker_name, message.chat.id)
+    speakers = [speaker.name for speaker in speaker_repository.get_speakers(chat_id=message.chat.id)]
+    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
+    for name in speakers[:30]:
+        keyboard.add(types.KeyboardButton(name))
+
+    safe_send_message(
+        message.chat.id,
+        "Send speaker name to edit.",
+        reply_markup=keyboard if speakers else types.ReplyKeyboardRemove(),
+    )
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_speaker_name, content_types=["text"])
+def process_edit_speaker_name(message: types.Message):
+    speaker_name = message.text.strip()
+    if not speaker_name:
+        safe_send_message(message.chat.id, "Speaker name cannot be empty.")
+        return
+
+    speaker = speaker_repository.get_speaker(speaker_name, chat_id=message.chat.id)
+    if speaker is None:
+        safe_send_message(message.chat.id, f"Speaker '{speaker_name}' not found. Try again.")
+        return
+
+    prompt_edit_speaker_actions(message.from_user.id, message.chat.id, speaker)
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_speaker_name)
+def process_edit_speaker_name_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Please send speaker name as text.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data in (EDIT_ACTION_RENAME, EDIT_ACTION_ADD_IMAGE, EDIT_ACTION_SET_PRIMARY, EDIT_ACTION_REMOVE_IMAGE, EDIT_ACTION_DONE))
+def process_edit_speaker_action(call: types.CallbackQuery):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     state = bot.get_state(user_id, chat_id)
 
-    if state != SpeakerState.waiting_for_if_add_image_answer.name:
+    if state != SpeakerEditState.waiting_for_action.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+    speaker = get_edit_speaker_from_state(user_id, chat_id)
+    if speaker is None:
+        safe_send_message(chat_id, "No speaker selected. Use /edit_speaker again.")
+        bot.delete_state(user_id, chat_id)
+        clear_edit_speaker_state_data(user_id, chat_id)
+        return
+
+    if call.data == EDIT_ACTION_DONE:
+        bot.delete_state(user_id, chat_id)
+        clear_edit_speaker_state_data(user_id, chat_id)
+        safe_send_message(chat_id, "Speaker edit finished.", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    if call.data == EDIT_ACTION_RENAME:
+        bot.set_state(user_id, SpeakerEditState.waiting_for_new_name, chat_id)
+        safe_send_message(chat_id, f"Send new name for '{speaker.name}'.")
+        return
+
+    if call.data == EDIT_ACTION_ADD_IMAGE:
+        bot.set_state(user_id, SpeakerEditState.waiting_for_new_image, chat_id)
+        safe_send_message(chat_id, f"Send sticker to add to '{speaker.name}'.")
+        return
+
+    if call.data == EDIT_ACTION_SET_PRIMARY:
+        if not speaker.speaker_image_ids:
+            safe_send_message(chat_id, "This speaker has no images.")
+            prompt_edit_speaker_actions(user_id, chat_id, speaker)
+            return
+        safe_send_message(
+            chat_id,
+            "Choose primary image:",
+            reply_markup=build_edit_speaker_image_keyboard(speaker, EDIT_SET_PRIMARY_PREFIX),
+        )
+        return
+
+    if call.data == EDIT_ACTION_REMOVE_IMAGE:
+        if not speaker.speaker_image_ids:
+            safe_send_message(chat_id, "This speaker has no images.")
+            prompt_edit_speaker_actions(user_id, chat_id, speaker)
+            return
+        safe_send_message(
+            chat_id,
+            "Choose image to remove:",
+            reply_markup=build_edit_speaker_image_keyboard(speaker, EDIT_REMOVE_IMAGE_PREFIX),
+        )
+        return
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_action)
+def process_edit_speaker_action_text_fallback(message: types.Message):
+    speaker = get_edit_speaker_from_state(message.from_user.id, message.chat.id)
+    if speaker is None:
+        safe_send_message(message.chat.id, "No speaker selected. Use /edit_speaker again.")
+        return
+
+    safe_send_message(
+        message.chat.id,
+        "Use buttons to choose edit action.",
+        reply_markup=build_edit_speaker_actions_keyboard(speaker),
+    )
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_new_name, content_types=["text"])
+def process_edit_speaker_new_name(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    speaker = get_edit_speaker_from_state(user_id, chat_id)
+    if speaker is None:
+        safe_send_message(chat_id, "No speaker selected. Use /edit_speaker again.")
+        bot.delete_state(user_id, chat_id)
+        clear_edit_speaker_state_data(user_id, chat_id)
+        return
+
+    new_name = " ".join(message.text.split()).strip()
+    if not new_name:
+        safe_send_message(chat_id, "New name cannot be empty.")
+        return
+
+    renamed = speaker_repository.rename_speaker(speaker.name, new_name, chat_id=chat_id)
+    if renamed is None:
+        safe_send_message(chat_id, "Failed to rename speaker.")
+        prompt_edit_speaker_actions(user_id, chat_id, speaker)
+        return
+
+    safe_send_message(chat_id, f"Speaker renamed to '{renamed.name}'.")
+    prompt_edit_speaker_actions(user_id, chat_id, renamed)
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_new_name)
+def process_edit_speaker_new_name_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Please send new speaker name as text.")
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_new_image, content_types=["sticker"])
+def process_edit_speaker_new_image(message: types.Message):
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    speaker = get_edit_speaker_from_state(user_id, chat_id)
+    if speaker is None:
+        safe_send_message(chat_id, "No speaker selected. Use /edit_speaker again.")
+        bot.delete_state(user_id, chat_id)
+        clear_edit_speaker_state_data(user_id, chat_id)
+        return
+
+    speaker.add_image_id(message.sticker.file_id)
+    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    safe_send_message(chat_id, f"Image added to '{speaker.name}'.")
+    prompt_edit_speaker_actions(user_id, chat_id, speaker)
+
+
+@bot.message_handler(state=SpeakerEditState.waiting_for_new_image)
+def process_edit_speaker_new_image_non_sticker(message: types.Message):
+    safe_send_message(message.chat.id, "Send a sticker to add as speaker image.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(EDIT_SET_PRIMARY_PREFIX))
+def process_edit_speaker_set_primary(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != SpeakerEditState.waiting_for_action.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+    speaker = get_edit_speaker_from_state(user_id, chat_id)
+    if speaker is None:
+        safe_send_message(chat_id, "No speaker selected. Use /edit_speaker again.")
+        return
+
+    try:
+        selected_index = int(call.data[len(EDIT_SET_PRIMARY_PREFIX):])
+    except ValueError:
+        safe_send_message(chat_id, "Invalid image selection.")
+        return
+
+    if selected_index < 0 or selected_index >= len(speaker.speaker_image_ids):
+        safe_send_message(chat_id, "Invalid image selection.")
+        return
+
+    selected_image = speaker.speaker_image_ids[selected_index]
+    speaker.speaker_image_ids = [selected_image] + [image_id for image_id in speaker.speaker_image_ids if image_id != selected_image]
+    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    safe_send_message(chat_id, f"Primary image updated for '{speaker.name}'.")
+    prompt_edit_speaker_actions(user_id, chat_id, speaker)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(EDIT_REMOVE_IMAGE_PREFIX))
+def process_edit_speaker_remove_image(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != SpeakerEditState.waiting_for_action.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+    speaker = get_edit_speaker_from_state(user_id, chat_id)
+    if speaker is None:
+        safe_send_message(chat_id, "No speaker selected. Use /edit_speaker again.")
+        return
+
+    try:
+        selected_index = int(call.data[len(EDIT_REMOVE_IMAGE_PREFIX):])
+    except ValueError:
+        safe_send_message(chat_id, "Invalid image selection.")
+        return
+
+    if selected_index < 0 or selected_index >= len(speaker.speaker_image_ids):
+        safe_send_message(chat_id, "Invalid image selection.")
+        return
+
+    removed_image = speaker.speaker_image_ids.pop(selected_index)
+    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    # Best-effort local cache cleanup.
+    sticker_file_cache.pop(removed_image, None)
+    safe_send_message(chat_id, f"Image removed from '{speaker.name}'.")
+    prompt_edit_speaker_actions(user_id, chat_id, speaker)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(PHRASE_IMAGE_PREFIX) or call.data == PHRASE_IMAGE_NONE)
+def process_phrase_image_selection(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != QuoteState.waiting_for_phrase_image_selection.name:
         bot.answer_callback_query(call.id)
         return
 
     bot.answer_callback_query(call.id)
 
-    if call.data == ADD_IMAGE_YES:
-        bot.set_state(user_id, SpeakerState.waiting_for_speaker_image, chat_id)
-        safe_send_message(chat_id, "Send one sticker for this speaker. It will update the speaker image.")
+    quote = ensure_quote_exists_for_session(user_id, chat_id)
+    if quote is None or not quote.phrases or not quote.phrases[-1].speaker:
+        safe_send_message(chat_id, "No active phrase for image selection.")
         return
 
-    safe_send_message(chat_id, "Okay, skipping speaker image.")
+    phrase = quote.phrases[-1]
+    speaker = phrase.speaker
+
+    if call.data == PHRASE_IMAGE_NONE:
+        phrase.speaker_image_id = None
+    else:
+        try:
+            selected_index = int(call.data[len(PHRASE_IMAGE_PREFIX):])
+        except ValueError:
+            safe_send_message(chat_id, "Invalid image selection.")
+            safe_send_message(chat_id, "Choose phrase image:", reply_markup=build_phrase_image_keyboard(speaker))
+            return
+
+        if selected_index < 0 or selected_index >= len(speaker.speaker_image_ids):
+            safe_send_message(chat_id, "Invalid image selection.")
+            safe_send_message(chat_id, "Choose phrase image:", reply_markup=build_phrase_image_keyboard(speaker))
+            return
+
+        phrase.speaker_image_id = speaker.speaker_image_ids[selected_index]
+
+    set_quote_to_state(user_id, chat_id, quote)
+    reset_render_cache(user_id, chat_id)
     prompt_context_for_last_phrase(user_id, chat_id)
 
 
-@bot.message_handler(state=SpeakerState.waiting_for_if_add_image_answer)
-def process_add_image_text_fallback(message: types.Message):
-    safe_send_message(message.chat.id, "Use the buttons: Yes or No.", reply_markup=build_add_image_keyboard())
-
-
-@bot.message_handler(state=SpeakerState.waiting_for_speaker_image, content_types=["sticker"])
-def process_speaker_image(message: types.Message):
+@bot.message_handler(state=QuoteState.waiting_for_phrase_image_selection)
+def process_phrase_image_text_fallback(message: types.Message):
     quote = ensure_quote_exists(message)
-    if quote is None:
+    if quote is None or not quote.phrases or not quote.phrases[-1].speaker:
         return
-
-    if not quote.phrases[-1].speaker:
-        safe_send_message(message.chat.id, "Speaker is missing. Please send speaker name again.")
-        bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
-        return
-
-    sticker_id = message.sticker.file_id
-    quote.phrases[-1].speaker.speaker_image_id = sticker_id
-
-    speaker_repository.save_speaker(quote.phrases[-1].speaker, chat_id=message.chat.id)
-    set_quote_to_state(message.from_user.id, message.chat.id, quote)
-    reset_render_cache(message.from_user.id, message.chat.id)
-
-    safe_send_message(message.chat.id, f"Updated sticker image for {quote.phrases[-1].speaker.name}.")
-    prompt_context_for_last_phrase(message.from_user.id, message.chat.id)
-
-
-@bot.message_handler(state=SpeakerState.waiting_for_speaker_image)
-def process_speaker_image_unknown(message: types.Message):
-    safe_send_message(message.chat.id, "Send a sticker, please.")
+    safe_send_message(
+        message.chat.id,
+        "Use the buttons to choose image for this phrase.",
+        reply_markup=build_phrase_image_keyboard(quote.phrases[-1].speaker),
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data in (ADD_CONTEXT_YES, ADD_CONTEXT_NO))

@@ -26,6 +26,22 @@ class JsonSpeakerRepository(SpeakerRepository):
     def _chat_key(self, chat_id: int | None) -> str:
         return str(chat_id) if chat_id is not None else GLOBAL_CHAT_KEY
 
+    def _unique_image_ids(self, image_ids: list[str]) -> list[str]:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for image_id in image_ids:
+            if image_id in seen:
+                continue
+            seen.add(image_id)
+            unique.append(image_id)
+        return unique
+
+    def _reindex_chat(self, chat_key: str) -> None:
+        self._index_by_chat[chat_key] = {
+            normalize_speaker_key(speaker.name): speaker
+            for speaker in self._speakers_by_chat[chat_key]
+        }
+
     def _load(self) -> None:
         if not os.path.exists(self.file_path):
             return
@@ -50,15 +66,27 @@ class JsonSpeakerRepository(SpeakerRepository):
                 name = item.get("name") if isinstance(item, dict) else None
                 if not name:
                     continue
-                speaker = Speaker(name=name, speaker_image_id=item.get("speaker_image_id"))
-                self._speakers_by_chat[chat_key].append(speaker)
-                self._index_by_chat[chat_key][normalize_speaker_key(name)] = speaker
 
-    def _serialize(self) -> dict[str, list[dict[str, str | None]]]:
-        serialized: dict[str, list[dict[str, str | None]]] = {}
+                image_ids: list[str] = []
+                if isinstance(item, dict):
+                    if isinstance(item.get("speaker_image_ids"), list):
+                        image_ids = [image_id for image_id in item["speaker_image_ids"] if isinstance(image_id, str)]
+                    elif item.get("speaker_image_id"):
+                        image_ids = [item["speaker_image_id"]]
+
+                speaker = Speaker(name=name, speaker_image_ids=self._unique_image_ids(image_ids))
+                self._speakers_by_chat[chat_key].append(speaker)
+
+            self._reindex_chat(chat_key)
+
+    def _serialize(self) -> dict[str, list[dict[str, str | list[str]]]]:
+        serialized: dict[str, list[dict[str, str | list[str]]]] = {}
         for chat_key, speakers in self._speakers_by_chat.items():
             serialized[chat_key] = [
-                {"name": speaker.name, "speaker_image_id": speaker.speaker_image_id}
+                {
+                    "name": speaker.name,
+                    "speaker_image_ids": self._unique_image_ids(speaker.speaker_image_ids),
+                }
                 for speaker in speakers
             ]
         return serialized
@@ -91,14 +119,16 @@ class JsonSpeakerRepository(SpeakerRepository):
 
         with self._lock:
             existing = self._index_by_chat[chat_key].get(key)
+            cleaned_image_ids = self._unique_image_ids(list(speaker.speaker_image_ids))
+
             if existing:
-                # Preserve latest display name and refresh image when provided.
                 existing.name = speaker.name
-                if speaker.speaker_image_id and existing.speaker_image_id != speaker.speaker_image_id:
-                    existing.speaker_image_id = speaker.speaker_image_id
+                existing.speaker_image_ids = cleaned_image_ids
             else:
-                self._speakers_by_chat[chat_key].append(speaker)
-                self._index_by_chat[chat_key][key] = speaker
+                new_speaker = Speaker(name=speaker.name, speaker_image_ids=cleaned_image_ids)
+                self._speakers_by_chat[chat_key].append(new_speaker)
+
+            self._reindex_chat(chat_key)
             self._write_atomic()
 
     def get_speaker(self, name: str, chat_id: int | None = None) -> Speaker | None:
@@ -106,3 +136,35 @@ class JsonSpeakerRepository(SpeakerRepository):
         key = normalize_speaker_key(name)
         with self._lock:
             return self._index_by_chat.get(chat_key, {}).get(key)
+
+    def rename_speaker(self, old_name: str, new_name: str, chat_id: int | None = None) -> Speaker | None:
+        chat_key = self._chat_key(chat_id)
+        old_key = normalize_speaker_key(old_name)
+        new_key = normalize_speaker_key(new_name)
+
+        with self._lock:
+            speakers_by_name = self._index_by_chat.get(chat_key, {})
+            source = speakers_by_name.get(old_key)
+            if source is None:
+                return None
+
+            if old_key == new_key:
+                source.name = new_name
+                self._reindex_chat(chat_key)
+                self._write_atomic()
+                return source
+
+            target = speakers_by_name.get(new_key)
+            if target and target is not source:
+                merged_ids = self._unique_image_ids(target.speaker_image_ids + source.speaker_image_ids)
+                target.speaker_image_ids = merged_ids
+                source_list = self._speakers_by_chat[chat_key]
+                self._speakers_by_chat[chat_key] = [speaker for speaker in source_list if speaker is not source]
+                self._reindex_chat(chat_key)
+                self._write_atomic()
+                return target
+
+            source.name = new_name
+            self._reindex_chat(chat_key)
+            self._write_atomic()
+            return source

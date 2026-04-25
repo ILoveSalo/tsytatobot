@@ -175,6 +175,21 @@ class QuoteImageGenerator:
                 return speaker
         return speakers[0]
 
+    def _get_main_speaker_image_id(self, quote: Quote, main_speaker: Speaker | None) -> str | None:
+        if main_speaker is None:
+            return None
+
+        main_key = main_speaker.name.casefold()
+        for phrase in quote.phrases:
+            if not phrase.speaker:
+                continue
+            if phrase.speaker.name.casefold() != main_key:
+                continue
+            if phrase.speaker_image_id:
+                return phrase.speaker_image_id
+
+        return main_speaker.speaker_image_id
+
     def _truncate_text_to_width(
         self,
         draw: ImageDraw.ImageDraw,
@@ -269,8 +284,9 @@ class QuoteImageGenerator:
 
         if images:
             main_image = None
-            if main_speaker and main_speaker.speaker_image_id:
-                main_image = images.get(main_speaker.speaker_image_id)
+            main_image_id = self._get_main_speaker_image_id(quote, main_speaker)
+            if main_image_id:
+                main_image = images.get(main_image_id)
             if main_image is None:
                 main_image = next(iter(images.values()))
             canvas = self.add_main_sticker_to_canvas(main_image, self.CANVAS_HEIGHT, canvas)
