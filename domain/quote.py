@@ -1,7 +1,10 @@
+﻿from dataclasses import dataclass, field
 from datetime import datetime
+
 from domain.phrase import Phrase
 
+
+@dataclass
 class Quote:
-    def __init__(self, phrases: list[Phrase], date: datetime):
-        self.phrases = phrases
-        self.date = date
+    phrases: list[Phrase] = field(default_factory=list)
+    date: datetime = field(default_factory=datetime.today)

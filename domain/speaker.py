@@ -1,4 +1,8 @@
+﻿from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
 class Speaker:
-    def __init__(self, name, speaker_image_id=None):
-        self.name = name
-        self.speaker_image_id = speaker_image_id
+    name: str
+    speaker_image_id: Optional[str] = None

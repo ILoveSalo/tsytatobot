@@ -1,7 +1,11 @@
+﻿from dataclasses import dataclass
+from typing import Optional
+
 from domain.speaker import Speaker
 
+
+@dataclass
 class Phrase:
-    def __init__(self, speaker: Speaker, text: str, context_text: str):
-        self.text = text
-        self.speaker = speaker
-        self.context_text = context_text
+    speaker: Optional[Speaker]
+    text: str
+    context_text: Optional[str] = None

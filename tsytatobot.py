@@ -1,467 +1,629 @@
-import io
-import math
+﻿import io
 import os
+from datetime import datetime
 
-from PIL import Image, ImageDraw, ImageFont
-from dotenv import load_dotenv
 import telebot
+from dotenv import load_dotenv
+from telebot import custom_filters, types
+from telebot.apihelper import ApiTelegramException
 from telebot.handler_backends import State, StatesGroup
-from telebot.storage import StateMemoryStorage
-from telebot import custom_filters
 from telebot.states.sync.middleware import StateMiddleware
-from telebot import types
+from telebot.storage import StateMemoryStorage, StatePickleStorage
 
 from date_parser.date_parser import DateParser
 from domain.phrase import Phrase
 from domain.quote import Quote
 from domain.speaker import Speaker
-from quote_generator.quote_image_generator import QuoteImageGenerator
 from persistence.impl.local_files.json.json_speaker_repository import JsonSpeakerRepository
 from persistence.speaker_repository import SpeakerRepository
+from quote_generator.quote_image_generator import QuoteImageGenerator
 from quote_generator.quote_text_generator import QuoteTextGenerator
+
 
 # ------------------ Infrastructure ------------------
 
-# Load variables from .env file (BOT_TOKEN, CHANNEL_ID, etc.)
 load_dotenv()
 
-# Helper: read env variable or throw an error if missing
-def read_env_variable(env_variable_name):
+
+def read_env_variable(env_variable_name: str) -> str:
     result = os.getenv(env_variable_name)
     if not result:
-        raise ValueError(env_variable_name + " was not found!")
+        raise ValueError(f"{env_variable_name} was not found!")
     return result
 
-# Bot configuration from environment
-BOT_TOKEN = read_env_variable('BOT_TOKEN')
-CHANNEL_ID = read_env_variable('CHANNEL_ID')
 
-# Use in-memory storage for states (will reset on restart)
-storage = StateMemoryStorage()
+BOT_TOKEN = read_env_variable("BOT_TOKEN")
+CHANNEL_ID = read_env_variable("CHANNEL_ID")
 
-# Initialize bot with state middleware
+STATE_STORAGE_TYPE = os.getenv("STATE_STORAGE", "memory").strip().lower()
+if STATE_STORAGE_TYPE == "pickle":
+    state_file_path = os.getenv("STATE_FILE_PATH", ".bot_state.pkl")
+    storage = StatePickleStorage(file_path=state_file_path)
+else:
+    storage = StateMemoryStorage()
 bot = telebot.TeleBot(BOT_TOKEN, state_storage=storage, use_class_middlewares=True)
-bot.add_custom_filter(custom_filters.StateFilter(bot))  # enables @bot.message_handler(state=...)
-bot.setup_middleware(StateMiddleware(bot))              # enables state transitions
+bot.add_custom_filter(custom_filters.StateFilter(bot))
+bot.setup_middleware(StateMiddleware(bot))
 
-# Repository for saving/retrieving speakers
 speaker_repository: SpeakerRepository = JsonSpeakerRepository("speakers.json")
 
 date_parser = DateParser()
 quote_text_generator = QuoteTextGenerator(date_parser)
 quote_image_generator = QuoteImageGenerator(quote_text_generator, date_parser)
 
+# Cache downloaded sticker bytes by Telegram file_id.
+sticker_file_cache: dict[str, bytes] = {}
+
+
 # ------------------ States ------------------
 
-# Quote creation flow
 class QuoteState(StatesGroup):
-    waiting_for_date = State()         # step 1: wait for date
-    waiting_for_next_step = State()    # step 4: after phrase+speaker → add more or finalize?
+    waiting_for_date = State()
+    waiting_for_next_step = State()
 
-# Phrase input flow
+
 class PhraseState(StatesGroup):
-    waiting_for_text = State()         # step 2: wait for phrase text
-    waiting_for_context_text = State() # (optional future feature)
+    waiting_for_text = State()
+    waiting_for_edit_last_text = State()
 
-# Speaker input flow
+
 class SpeakerState(StatesGroup):
-    waiting_for_name = State()         # step 3: wait for speaker’s name
-    waiting_for_name_end = State()
+    waiting_for_name = State()
     waiting_for_if_add_image_answer = State()
     waiting_for_speaker_image = State()
 
 
+# ------------------ Callback data ------------------
+
+DATE_TODAY = "quote:date:today"
+ADD_IMAGE_YES = "quote:add_image:yes"
+ADD_IMAGE_NO = "quote:add_image:no"
+NEXT_ADD = "quote:next:add"
+NEXT_FINALIZE = "quote:next:finalize"
+NEXT_CANCEL = "quote:next:cancel"
+
+
 # ------------------ Utils ------------------
 
-# Retrieve Quote object from current user’s state
-def get_quote_from_state(user_id, chat_id):
+def clear_session(user_id: int, chat_id: int) -> None:
+    bot.delete_state(user_id, chat_id)
+    with bot.retrieve_data(user_id, chat_id) as data:
+        data.clear()
+
+
+def get_quote_from_state(user_id: int, chat_id: int) -> Quote | None:
     with bot.retrieve_data(user_id, chat_id) as data:
         return data.get("quote")
 
-# Retrieve bypass image variable from current user’s state
-def get_bypass_image_from_state(user_id, chat_id):
-    with bot.retrieve_data(user_id, chat_id) as data:
-        return data.get("bypass_image")
 
-def download_sticker_images_for_quote(quote: Quote):
-    indexed_images = {}
+def set_quote_to_state(user_id: int, chat_id: int, quote: Quote) -> None:
+    bot.add_data(user_id, chat_id, quote=quote)
 
+
+def get_speaker_display_name_from_user(user: types.User) -> str:
+    full_name = " ".join(part for part in [user.first_name, user.last_name] if part).strip()
+    if full_name:
+        return full_name
+    return user.username or str(user.id)
+
+
+def get_or_create_speaker(name: str, chat_id: int) -> Speaker:
+    normalized_name = " ".join(name.split()).strip()
+    existing = speaker_repository.get_speaker(normalized_name, chat_id=chat_id)
+    if existing:
+        return existing
+
+    speaker = Speaker(name=normalized_name)
+    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    return speaker
+
+
+def build_quote_signature(quote: Quote) -> tuple:
+    phrase_signature = tuple(
+        (
+            phrase.text,
+            phrase.speaker.name if phrase.speaker else None,
+            phrase.speaker.speaker_image_id if phrase.speaker else None,
+        )
+        for phrase in quote.phrases
+    )
+    return quote.date.isoformat(), phrase_signature
+
+
+def bytes_to_image_io(image_bytes: bytes, name: str = "quote.png") -> io.BytesIO:
+    output = io.BytesIO(image_bytes)
+    output.name = name
+    output.seek(0)
+    return output
+
+
+def download_sticker_images_for_quote(quote: Quote) -> dict[str, bytes]:
+    indexed_images: dict[str, bytes] = {}
     for phrase in quote.phrases:
-        if phrase.speaker.speaker_image_id is None:
+        if not phrase.speaker or not phrase.speaker.speaker_image_id:
             continue
 
-        # 1. Download sticker from Telegram
-        file_info = bot.get_file(phrase.speaker.speaker_image_id)
-        downloaded_file = bot.download_file(file_info.file_path)
+        file_id = phrase.speaker.speaker_image_id
+        if file_id in indexed_images:
+            continue
 
-        indexed_images[phrase.speaker.speaker_image_id] = downloaded_file
+        if file_id in sticker_file_cache:
+            indexed_images[file_id] = sticker_file_cache[file_id]
+            continue
+
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        sticker_file_cache[file_id] = downloaded_file
+        indexed_images[file_id] = downloaded_file
 
     return indexed_images
 
-def get_quote_text_and_image(quote: Quote):
-    indexed_images = download_sticker_images_for_quote(quote)
 
+def get_quote_text_and_image(quote: Quote, user_id: int, chat_id: int) -> tuple[str, io.BytesIO]:
+    signature = build_quote_signature(quote)
+
+    with bot.retrieve_data(user_id, chat_id) as data:
+        cached_signature = data.get("rendered_signature")
+        cached_text = data.get("rendered_quote_text")
+        cached_image = data.get("rendered_image_bytes")
+        if cached_signature == signature and cached_text and cached_image:
+            return cached_text, bytes_to_image_io(cached_image)
+
+    indexed_images = download_sticker_images_for_quote(quote)
     image = quote_image_generator.generate_quote_image(quote, indexed_images)
     quote_text = quote_text_generator.generate_quote_with_tags(quote)
 
-    return quote_text, image
-
-# ------------------ Handlers ------------------
-
-# Step 0: /quote → start quote creation
-@bot.message_handler(commands=['quote'])
-def create_quote(message):
-    bot.delete_state(message.from_user.id, message.chat.id)  # reset previous state
-
-    bot.reply_to(message, "Nice! Let's create a new quote!")
-
-    # Keyboard with quick options (e.g., "Today")
-    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
-    buttons = [types.KeyboardButton("📅 Today")]
-    keyboard.add(*buttons)
-
-    bot.send_message(
-        message.chat.id,
-        "Let's start with the date. When did you hear these words? (dd.mm.yyyy or today)",
-        reply_markup=keyboard
+    image_bytes = image.getvalue()
+    bot.add_data(
+        user_id,
+        chat_id,
+        rendered_signature=signature,
+        rendered_quote_text=quote_text,
+        rendered_image_bytes=image_bytes,
     )
-    bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
+
+    return quote_text, bytes_to_image_io(image_bytes)
 
 
-# Step 1: handle date input
-@bot.message_handler(state=QuoteState.waiting_for_date)
-def process_quote_date(message):
+def reset_render_cache(user_id: int, chat_id: int) -> None:
+    with bot.retrieve_data(user_id, chat_id) as data:
+        data.pop("rendered_signature", None)
+        data.pop("rendered_quote_text", None)
+        data.pop("rendered_image_bytes", None)
+
+
+def safe_send_message(chat_id: int | str, text: str, **kwargs):
     try:
-        date = date_parser.parse_string_to_date(message.text)
-    except:
-        bot.reply_to(message, "That doesn’t look like a valid date. Example: 25.06.2005. Try again.")
-        bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
+        return bot.send_message(chat_id, text, **kwargs)
+    except ApiTelegramException:
+        return None
+
+
+def safe_send_photo(chat_id: int | str, photo: io.BytesIO, caption: str | None = None, **kwargs):
+    try:
+        return bot.send_photo(chat_id, photo=photo, caption=caption, **kwargs)
+    except ApiTelegramException:
+        return None
+
+
+def ensure_quote_exists(message: types.Message) -> Quote | None:
+    quote = get_quote_from_state(message.from_user.id, message.chat.id)
+    if quote is None:
+        safe_send_message(message.chat.id, "There is no active quote. Use /quote to start one.")
+    return quote
+
+
+def build_date_keyboard() -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("📅 Today", callback_data=DATE_TODAY))
+    return keyboard
+
+
+def build_add_image_keyboard() -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("Yes", callback_data=ADD_IMAGE_YES),
+        types.InlineKeyboardButton("No", callback_data=ADD_IMAGE_NO),
+    )
+    return keyboard
+
+
+def build_next_step_keyboard() -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    keyboard.add(
+        types.InlineKeyboardButton("➕ Add", callback_data=NEXT_ADD),
+        types.InlineKeyboardButton("✅ Finalize", callback_data=NEXT_FINALIZE),
+        types.InlineKeyboardButton("❌ Cancel", callback_data=NEXT_CANCEL),
+    )
+    return keyboard
+
+
+def continue_after_speaker_set(message: types.Message) -> None:
+    quote = ensure_quote_exists(message)
+    if quote is None:
         return
 
-    # Save empty quote with this date
-    bot.add_data(message.from_user.id, message.chat.id, quote=Quote([], date))
-
-    # Ask for first phrase
-    bot.send_message(message.chat.id, f"Cool! So, what was said on {date_parser.parse_date_to_string(date)}?")
-    bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
-
-
-# Step 2: handle phrase text
-@bot.message_handler(state=PhraseState.waiting_for_text)
-def process_phrase_text(message):
-    text = message.text
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
-
-    # Add phrase with placeholder speaker
-    quote.phrases.append(Phrase(None, text, None))
-    bot.add_data(message.from_user.id, message.chat.id, quote=quote)
-
-    # Move to speaker state
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
-
-    # Suggest known speakers as keyboard options
-    speakers = [s.name for s in speaker_repository.get_speakers()]
-    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
-    keyboard.add(*[types.KeyboardButton(name) for name in speakers])
-
-    bot.send_message(
-        message.chat.id,
-        f"\"{text}\", such wise words! ദ്ദി(˵ •̀ ᴗ - ˵ ) ✧\n"
-        f"Now, who is the wise person that said this?",
-        reply_markup=keyboard
-    )
-
-
-# Step 3: handle speaker name
-@bot.message_handler(func=lambda m: speaker_repository.get_speaker(m.text) is None, state=SpeakerState.waiting_for_name)
-def process_new_speaker_name(message):
-    name = message.text
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
-
-    # Create and attach speaker to last phrase
-    quote.phrases[-1].speaker = Speaker(name)
-
-    # Save speaker for future suggestions
-    speaker_repository.save_speaker(quote.phrases[-1].speaker)
-
-    bot.add_data(message.from_user.id, message.chat.id, quote=quote)
-
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name_end, message.chat.id)
-    continue_after_speaker_set(message)
-
-@bot.message_handler(func=lambda m: speaker_repository.get_speaker(m.text) is not None, state=SpeakerState.waiting_for_name)
-def process_existing_speaker_name(message):
-    name = message.text
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
-
-    # Get speaker
-    speaker = speaker_repository.get_speaker(name)
-
-    # Attach speaker to last phrase
-    quote.phrases[-1].speaker = speaker
-
-    bot.add_data(message.from_user.id, message.chat.id, quote=quote)
-
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name_end, message.chat.id)
-    continue_after_speaker_set(message)
-
-def continue_after_speaker_set(message):
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
     speaker = quote.phrases[-1].speaker
+    if speaker is None:
+        safe_send_message(message.chat.id, "Speaker is missing. Please send the speaker name.")
+        bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
+        return
 
-    if speaker.speaker_image_id is None and not get_bypass_image_from_state(message.from_user.id, message.chat.id):
+    if speaker.speaker_image_id is None:
         bot.set_state(message.from_user.id, SpeakerState.waiting_for_if_add_image_answer, message.chat.id)
-        keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
-        keyboard.add(types.KeyboardButton("✔️ Yes"), types.KeyboardButton("❌ No"))
-        bot.send_message(message.chat.id, f"Seems like {speaker.name} has no image. Do you want to add one?", reply_markup=keyboard)
+        safe_send_message(
+            message.chat.id,
+            f"{speaker.name} has no sticker image yet. Add one?",
+            reply_markup=build_add_image_keyboard(),
+        )
     else:
         bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
         process_speaker_name_end(message)
 
-@bot.message_handler(func=lambda m: m.text.lower().strip() in ["yes", "✔️ yes"], state=SpeakerState.waiting_for_if_add_image_answer)
-def process_speaker_id_add_image_answer_yes(message):
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_speaker_image, message.chat.id)
-    bot.send_message(message.chat.id, "Awesome! Send me a sticker and I will add it to this person! 📸")
 
-@bot.message_handler(func=lambda m: m.text.lower().strip() in ["no", "❌ no"], state=SpeakerState.waiting_for_if_add_image_answer)
-def process_speaker_id_add_image_answer_no(message):
-    bot.add_data(message.from_user.id, message.chat.id, bypass_image=True)
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name_end, message.chat.id)
-    bot.send_message(message.chat.id, "That's unfortunate(( Ok, let's continue.")
+def process_speaker_name_end(message: types.Message) -> None:
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    name = quote.phrases[-1].speaker.name if quote.phrases[-1].speaker else "Unknown"
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+
+    try:
+        quote_text, image = get_quote_text_and_image(quote, message.from_user.id, message.chat.id)
+    except ApiTelegramException:
+        safe_send_message(message.chat.id, "Failed to build preview because Telegram API request failed.")
+        return
+    except Exception:
+        safe_send_message(message.chat.id, "Failed to build preview due to image rendering error.")
+        return
+
+    safe_send_message(message.chat.id, f"Did {name} really say that? Your quote preview:")
+    safe_send_photo(message.chat.id, photo=image, caption=quote_text)
+    safe_send_message(
+        message.chat.id,
+        "Do you want to add a new phrase or finalize the quote?",
+        reply_markup=build_next_step_keyboard(),
+    )
+
+
+def finalize_quote(user_id: int, chat_id: int) -> None:
+    quote = get_quote_from_state(user_id, chat_id)
+    if quote is None:
+        safe_send_message(chat_id, "There is no active quote. Use /quote.")
+        clear_session(user_id, chat_id)
+        return
+
+    try:
+        quote_text, image = get_quote_text_and_image(quote, user_id, chat_id)
+    except Exception:
+        safe_send_message(chat_id, "Failed to finalize quote because preview data is unavailable.")
+        return
+
+    channel_message = safe_send_photo(CHANNEL_ID, photo=image, caption=quote_text)
+    if channel_message is None:
+        safe_send_message(chat_id, "Failed to post in channel. Check bot permissions and CHANNEL_ID.")
+        return
+
+    safe_send_message(chat_id, "Done.", reply_markup=types.ReplyKeyboardRemove())
+    clear_session(user_id, chat_id)
+
+
+# ------------------ Handlers ------------------
+
+@bot.message_handler(commands=["quote"])
+def create_quote(message: types.Message):
+    clear_session(message.from_user.id, message.chat.id)
+    safe_send_message(message.chat.id, "Let\'s create a new quote.")
+    safe_send_message(
+        message.chat.id,
+        "When did you hear these words? Send date as dd.mm.yyyy or use the button.",
+        reply_markup=build_date_keyboard(),
+    )
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == DATE_TODAY)
+def process_today_callback(call: types.CallbackQuery):
+    if bot.get_state(call.from_user.id, call.message.chat.id) != QuoteState.waiting_for_date.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+    quote = Quote([], datetime.today())
+    set_quote_to_state(call.from_user.id, call.message.chat.id, quote)
+
+    safe_send_message(
+        call.message.chat.id,
+        f"Great. What was said on {date_parser.parse_date_to_string(quote.date)}?",
+        reply_markup=types.ReplyKeyboardRemove(),
+    )
+    bot.set_state(call.from_user.id, PhraseState.waiting_for_text, call.message.chat.id)
+
+
+@bot.message_handler(state=QuoteState.waiting_for_date, content_types=["text"])
+def process_quote_date(message: types.Message):
+    try:
+        date = date_parser.parse_string_to_date(message.text)
+    except ValueError:
+        safe_send_message(message.chat.id, "Invalid date. Example: 25.06.2005")
+        bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
+        return
+
+    set_quote_to_state(message.from_user.id, message.chat.id, Quote([], date))
+    safe_send_message(message.chat.id, f"Nice. What was said on {date_parser.parse_date_to_string(date)}?")
+    bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
+
+
+@bot.message_handler(state=QuoteState.waiting_for_date)
+def process_quote_date_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Please send the date as text in dd.mm.yyyy format.")
+
+
+@bot.message_handler(state=PhraseState.waiting_for_text, content_types=["text"])
+def process_phrase_text(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    text = message.text.strip()
+    if not text:
+        safe_send_message(message.chat.id, "Phrase text cannot be empty.")
+        return
+
+    quote.phrases.append(Phrase(speaker=None, text=text))
+    set_quote_to_state(message.from_user.id, message.chat.id, quote)
+    reset_render_cache(message.from_user.id, message.chat.id)
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        speaker_name = get_speaker_display_name_from_user(message.reply_to_message.from_user)
+        speaker = get_or_create_speaker(speaker_name, chat_id=message.chat.id)
+        quote.phrases[-1].speaker = speaker
+        set_quote_to_state(message.from_user.id, message.chat.id, quote)
+
+        safe_send_message(message.chat.id, f"Using replied user as speaker: {speaker.name}")
+        continue_after_speaker_set(message)
+        return
+
+    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
+
+    speakers = [speaker.name for speaker in speaker_repository.get_speakers(chat_id=message.chat.id)]
+    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
+    for name in speakers[:30]:
+        keyboard.add(types.KeyboardButton(name))
+
+    safe_send_message(
+        message.chat.id,
+        f'"{text}"\nWho said this?',
+        reply_markup=keyboard if speakers else types.ReplyKeyboardRemove(),
+    )
+
+
+@bot.message_handler(state=PhraseState.waiting_for_text)
+def process_phrase_text_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Please send phrase text.")
+
+
+@bot.message_handler(state=SpeakerState.waiting_for_name, content_types=["text"])
+def process_speaker_name(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    name = message.text.strip()
+    if not name:
+        safe_send_message(message.chat.id, "Speaker name cannot be empty.")
+        return
+
+    speaker = get_or_create_speaker(name, chat_id=message.chat.id)
+    quote.phrases[-1].speaker = speaker
+    set_quote_to_state(message.from_user.id, message.chat.id, quote)
+    reset_render_cache(message.from_user.id, message.chat.id)
+
+    safe_send_message(message.chat.id, "Speaker saved.", reply_markup=types.ReplyKeyboardRemove())
     continue_after_speaker_set(message)
 
+
+@bot.message_handler(state=SpeakerState.waiting_for_name)
+def process_speaker_name_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Please send the speaker name as text.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data in (ADD_IMAGE_YES, ADD_IMAGE_NO))
+def process_add_image_callback(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != SpeakerState.waiting_for_if_add_image_answer.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if call.data == ADD_IMAGE_YES:
+        bot.set_state(user_id, SpeakerState.waiting_for_speaker_image, chat_id)
+        safe_send_message(chat_id, "Send one sticker for this speaker.")
+        return
+
+    bot.set_state(user_id, QuoteState.waiting_for_next_step, chat_id)
+    safe_send_message(chat_id, "Okay, skipping speaker image.")
+    process_speaker_name_end(call.message)
+
+
 @bot.message_handler(state=SpeakerState.waiting_for_if_add_image_answer)
-def process_speaker_id_add_image_answer_unknown(message):
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name_end, message.chat.id)
-    bot.send_message(message.chat.id, "...What? Next time say Yes ot No, please.")
+def process_add_image_text_fallback(message: types.Message):
+    safe_send_message(message.chat.id, "Use the buttons: Yes or No.", reply_markup=build_add_image_keyboard())
 
-@bot.message_handler(state=SpeakerState.waiting_for_speaker_image, content_types=['sticker'])
-def process_speaker_image(message):
+
+@bot.message_handler(state=SpeakerState.waiting_for_speaker_image, content_types=["sticker"])
+def process_speaker_image(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    if not quote.phrases[-1].speaker:
+        safe_send_message(message.chat.id, "Speaker is missing. Please send speaker name again.")
+        bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
+        return
+
     sticker_id = message.sticker.file_id
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
-
     quote.phrases[-1].speaker.speaker_image_id = sticker_id
-    speaker_repository.save_speaker(quote.phrases[-1].speaker)
 
-    bot.set_state(message.from_user.id, SpeakerState.waiting_for_name_end, message.chat.id)
+    speaker_repository.save_speaker(quote.phrases[-1].speaker, chat_id=message.chat.id)
+    set_quote_to_state(message.from_user.id, message.chat.id, quote)
+    reset_render_cache(message.from_user.id, message.chat.id)
 
-    bot.add_data(message.from_user.id, message.chat.id, quote=quote)
-
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
     process_speaker_name_end(message)
 
+
 @bot.message_handler(state=SpeakerState.waiting_for_speaker_image)
-def process_speaker_image_unknown(message):
-    bot.send_message(message.chat.id, "Send a sticker, please.")
-
-@bot.message_handler(
-    func=lambda m: get_quote_from_state(m.from_user.id, m.chat.id).phrases[-1].speaker.speaker_image_id is not None or
-                   get_bypass_image_from_state(m.from_user.id, m.chat.id) is True,
-    state=SpeakerState.waiting_for_name_end)
-def process_speaker_name_end(message):
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
-    name = quote.phrases[-1].speaker.name
-
-    # Move to "what next?" state
-    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
-
-    quote_text, image = get_quote_text_and_image(quote)
-
-    # Show preview
-    bot.send_message(message.chat.id, f"Did {name} really say that??? (¬_¬\")\nYour phrase is:")
-    bot.send_photo(message.chat.id, photo=image, caption=quote_text)
-    #bot.send_message(message.chat.id, quote_text_generator.generate_quote_with_tags(quote))
-
-    # Offer choices: add, finalize, cancel
-    keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
-    buttons = [types.KeyboardButton(x) for x in ["➕ Add", "✔️ Finalize", "❌ Cancel"]]
-    keyboard.add(*buttons)
-
-    bot.send_message(message.chat.id, "Do you want to add a new phrase or finalize the quote?", reply_markup=keyboard)
-
-# Step 4: finalize option
-@bot.message_handler(func=lambda m: m.text.lower().strip() in ["finalize", "✔️ finalize"], state=QuoteState.waiting_for_next_step)
-def process_next_step_finalize_option(message):
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
-
-    quote_text, image = get_quote_text_and_image(quote)
-
-    # Post final quote to channel
-    #bot.send_message(CHANNEL_ID, quote_text_generator.generate_quote_with_tags(quote))
-    bot.send_photo(CHANNEL_ID, photo=image, caption=quote_text)
-    bot.send_message(message.chat.id, "Done! (⸝⸝> ᴗ•⸝⸝)")
-    bot.delete_state(message.from_user.id, message.chat.id)
+def process_speaker_image_unknown(message: types.Message):
+    safe_send_message(message.chat.id, "Send a sticker, please.")
 
 
-# Step 4: add another phrase option
-@bot.message_handler(func=lambda m: m.text.lower().strip() in ["add", "➕ add"], state=QuoteState.waiting_for_next_step)
-def process_next_step_add_option(message):
-    bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
-    bot.send_message(message.chat.id, "Yes, captain! What is the text of the next phrase?")
+@bot.callback_query_handler(func=lambda call: call.data in (NEXT_ADD, NEXT_FINALIZE, NEXT_CANCEL))
+def process_next_step_callback(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != QuoteState.waiting_for_next_step.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if call.data == NEXT_ADD:
+        bot.set_state(user_id, PhraseState.waiting_for_text, chat_id)
+        safe_send_message(chat_id, "Send the next phrase text.")
+        return
+
+    if call.data == NEXT_CANCEL:
+        clear_session(user_id, chat_id)
+        safe_send_message(chat_id, "Cancelled.", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    finalize_quote(user_id=user_id, chat_id=chat_id)
 
 
-# Step 4: cancel option
-@bot.message_handler(func=lambda m: m.text.lower().strip() in ["cancel", "❌ cancel"], state="*")
-def process_cancel(message):
-    bot.delete_state(message.from_user.id, message.chat.id)
-    with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data.clear()
-    bot.send_message(message.chat.id, "❌ Cancelled.")
-
-
-# Step 4: invalid option (fallback)
 @bot.message_handler(state=QuoteState.waiting_for_next_step)
-def process_next_step_incorrect_option(message):
-    bot.reply_to(message, "I don't know what to do with that. Let's try again.")
-    bot.send_message(message.chat.id, "Do you want to add a new phrase or finalize the quote?")
-    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+def process_next_step_text_fallback(message: types.Message):
+    safe_send_message(
+        message.chat.id,
+        "Use the buttons to continue.",
+        reply_markup=build_next_step_keyboard(),
+    )
 
-# def crop_transparency(img: Image.Image) -> Image.Image:
-#     """Crop transparent borders from RGBA image."""
-#     if img.mode != "RGBA":
-#         img = img.convert("RGBA")
-#     bbox = img.getbbox()  # bounding box of non-zero regions in alpha
-#     if bbox:
-#         return img.crop(bbox)
-#     return img
-#
-#
-# def create_radial_gradient(size, inner_color, outer_color):
-#     """Generate a radial gradient image (RGBA)."""
-#     width, height = size
-#     center_x, center_y = width // 2, height // 2
-#     max_radius = math.sqrt(center_x**2 + center_y**2)
-#
-#     gradient = Image.new("RGBA", (width, height), outer_color)
-#     draw = ImageDraw.Draw(gradient)
-#
-#     for y in range(height):
-#         for x in range(width):
-#             # Distance from center
-#             dx = x - center_x
-#             dy = y - center_y
-#             dist = math.sqrt(dx*dx + dy*dy) / max_radius
-#
-#             # Clamp [0..1]
-#             dist = min(1, dist)
-#
-#             # Interpolate colors
-#             r = int(inner_color[0] + (outer_color[0] - inner_color[0]) * dist)
-#             g = int(inner_color[1] + (outer_color[1] - inner_color[1]) * dist)
-#             b = int(inner_color[2] + (outer_color[2] - inner_color[2]) * dist)
-#             a = int(inner_color[3] + (outer_color[3] - inner_color[3]) * dist)
-#
-#             draw.point((x, y), (r, g, b, a))
-#
-#     return gradient
-#
-# @bot.message_handler(content_types=['sticker'])
-# def handle_sticker(message):
-#     # 1. Download sticker from Telegram
-#     file_info = bot.get_file(message.sticker.file_id)
-#     downloaded_file = bot.download_file(file_info.file_path)
-#
-#     # 2. Open sticker (usually .webp with alpha channel)
-#     sticker_img = Image.open(io.BytesIO(downloaded_file)).convert("RGBA")
-#     quote_sign_img = Image.open("assets/quote-sign.png").convert("RGBA")
-#     scroll_img = Image.open("assets/scroll.png").convert("RGBA")
-#
-#     # --- Crop empty space ---
-#     sticker_img = crop_transparency(sticker_img)
-#
-#     # 3. Create radial gradient background
-#     new_width = 1100
-#     new_height = 512
-#     canvas = create_radial_gradient(
-#         (new_width, new_height),
-#         inner_color=(44, 211, 189, 255),  # center color
-#         outer_color=(36, 129, 117, 255)  # edge color
-#     )
-#
-#     #canvas = Image.new("RGBA", (new_width, new_height), (36, 129, 117, 255))  # transparent background
-#
-#     # --- Make second sticker zoomed + semitransparent ---
-#     zoom_factor = 1.7
-#     zoomed_size = (int(sticker_img.width * zoom_factor), int(sticker_img.height * zoom_factor))
-#     sticker_zoomed = sticker_img.resize(zoomed_size, Image.LANCZOS)
-#
-#     # Convert zoomed image to grayscale but keep alpha
-#     sticker_zoomed = sticker_zoomed.convert("LA").convert("RGBA")
-#
-#     # Reduce opacity
-#     sticker_alpha = sticker_zoomed.split()[3]  # get alpha channel
-#     sticker_alpha = sticker_alpha.point(lambda p: p * 0.25)  # 25% transparent
-#     sticker_zoomed.putalpha(sticker_alpha)
-#
-#     # Reduce opacity
-#     scroll_alpha = scroll_img.split()[3]  # get alpha channel
-#     scroll_alpha = scroll_alpha.point(lambda p: p * 0.33)  # 33% transparent
-#     scroll_img.putalpha(scroll_alpha)
-#
-#     # Ensure canvas is RGBA
-#     canvas = canvas.convert("RGBA")
-#
-#     # 1️⃣ Scroll image layer
-#     scroll_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-#     scroll_layer.paste(scroll_img, (new_width - scroll_img.width - 10, 0), scroll_img)
-#     canvas = Image.alpha_composite(canvas, scroll_layer)
-#
-#     # 2️⃣ Zoomed sticker layer
-#     canvas.paste(sticker_zoomed, (512 - zoomed_size[0], 0), sticker_zoomed)
-#
-#     # 3️⃣ Original sticker layer (bottom)
-#     sticker_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-#     sticker_layer.paste(sticker_img, (0, new_height - sticker_img.height), sticker_img)
-#     canvas = Image.alpha_composite(canvas, sticker_layer)
-#
-#     # 4. Draw text
-#     draw = ImageDraw.Draw(canvas)
-#     try:
-#         font = ImageFont.truetype("assets/SourceSans3-BoldItalic.ttf", 60)  # needs Arial installed
-#     except:
-#         font = ImageFont.load_default()
-#
-#     text = "Верни очко!"
-#     text_width, text_height = draw.textbbox((0, 0), text, font=font)[2:]
-#     x = 512 + (new_width - 512 - text_width) // 2
-#     y = (new_height - text_height) // 2
-#     draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
-#
-#     # 4b. Draw second text
-#     try:
-#         font2 = ImageFont.truetype("assets/Gabriela-Regular.ttf", 40)  # smaller
-#     except:
-#         font2 = ImageFont.load_default()
-#
-#     text2 = "Ігорьочок"
-#     text2_width, text2_height = draw.textbbox((0, 0), text2, font=font2)[2:]
-#     x2 = 512 + 20
-#     y2 = new_height - text2_height - 10  # 10 px space below first text
-#     draw.text((x2, y2), text2, font=font2, fill=(255, 255, 255, 255))
-#
-#     # 4c. Draw third text
-#     text3 = "21.09.2025"
-#     text3_width, text3_height = draw.textbbox((0, 0), text2, font=font2)[2:]
-#     x3 = new_width - text3_width - 40
-#     y3 = new_height - text3_height - 10  # 10 px space below first text
-#     draw.text((x3, y3), text3, font=font2, fill=(255, 255, 255, 255))
-#
-#     # 4️⃣ Quote sign (if you want it on top)
-#     quote_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-#     quote_layer.paste(quote_sign_img, (x - 15, y - quote_sign_img.height), quote_sign_img)
-#     canvas = Image.alpha_composite(canvas, quote_layer)
-#
-#     # 5. Save to memory as PNG
-#     output = io.BytesIO()
-#     output.name = "sticker_with_text.png"
-#     canvas.save(output, format="PNG")
-#     output.seek(0)
-#
-#     # 6. Send as photo
-#     #bot.send_document(message.chat.id, output, visible_file_name="sticker_with_text.png")
-#     bot.send_photo(message.chat.id, photo=output, caption="Here’s your sticker as an image 📸")
+
+@bot.message_handler(commands=["preview"], state="*")
+def process_preview_command(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    try:
+        quote_text, image = get_quote_text_and_image(quote, message.from_user.id, message.chat.id)
+    except Exception:
+        safe_send_message(message.chat.id, "Could not build preview right now.")
+        return
+
+    safe_send_photo(message.chat.id, photo=image, caption=quote_text)
+
+
+@bot.message_handler(commands=["done"], state="*")
+def process_done_command(message: types.Message):
+    if bot.get_state(message.from_user.id, message.chat.id) != QuoteState.waiting_for_next_step.name:
+        safe_send_message(message.chat.id, "Use /done after at least one complete phrase with speaker.")
+        return
+
+    finalize_quote(user_id=message.from_user.id, chat_id=message.chat.id)
+
+
+@bot.message_handler(commands=["remove_last"], state="*")
+def process_remove_last(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    if not quote.phrases:
+        safe_send_message(message.chat.id, "Quote has no phrases yet.")
+        return
+
+    removed = quote.phrases.pop()
+    set_quote_to_state(message.from_user.id, message.chat.id, quote)
+    reset_render_cache(message.from_user.id, message.chat.id)
+
+    safe_send_message(message.chat.id, f"Removed: {removed.text}")
+
+    if not quote.phrases:
+        bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
+        safe_send_message(message.chat.id, "Quote is empty now. Send a new phrase.")
+        return
+
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+    process_speaker_name_end(message)
+
+
+@bot.message_handler(commands=["edit_last"], state="*")
+def process_edit_last(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    if not quote.phrases:
+        safe_send_message(message.chat.id, "Quote has no phrases yet.")
+        return
+
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) == 2 and command_parts[1].strip():
+        quote.phrases[-1].text = command_parts[1].strip()
+        set_quote_to_state(message.from_user.id, message.chat.id, quote)
+        reset_render_cache(message.from_user.id, message.chat.id)
+        bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+        safe_send_message(message.chat.id, "Last phrase updated.")
+        process_speaker_name_end(message)
+        return
+
+    bot.set_state(message.from_user.id, PhraseState.waiting_for_edit_last_text, message.chat.id)
+    safe_send_message(message.chat.id, "Send new text for the last phrase.")
+
+
+@bot.message_handler(state=PhraseState.waiting_for_edit_last_text, content_types=["text"])
+def process_edit_last_text(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    if not quote.phrases:
+        safe_send_message(message.chat.id, "Quote has no phrases.")
+        bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
+        return
+
+    new_text = message.text.strip()
+    if not new_text:
+        safe_send_message(message.chat.id, "Text cannot be empty.")
+        return
+
+    quote.phrases[-1].text = new_text
+    set_quote_to_state(message.from_user.id, message.chat.id, quote)
+    reset_render_cache(message.from_user.id, message.chat.id)
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+    process_speaker_name_end(message)
+
+
+@bot.message_handler(state=PhraseState.waiting_for_edit_last_text)
+def process_edit_last_text_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Send text for the updated phrase.")
+
+
+@bot.message_handler(commands=["cancel"], state="*")
+def process_cancel(message: types.Message):
+    clear_session(message.from_user.id, message.chat.id)
+    safe_send_message(message.chat.id, "Cancelled.", reply_markup=types.ReplyKeyboardRemove())
 
 
 # ------------------ Run ------------------
 
-# Start polling loop (runs until stopped)
-bot.infinity_polling()
+bot.infinity_polling(skip_pending=True)
