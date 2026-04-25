@@ -59,11 +59,14 @@ sticker_file_cache: dict[str, bytes] = {}
 
 class QuoteState(StatesGroup):
     waiting_for_date = State()
+    waiting_for_context_decision = State()
+    waiting_for_main_speaker = State()
     waiting_for_next_step = State()
 
 
 class PhraseState(StatesGroup):
     waiting_for_text = State()
+    waiting_for_context_text = State()
     waiting_for_edit_last_text = State()
 
 
@@ -78,7 +81,11 @@ class SpeakerState(StatesGroup):
 DATE_TODAY = "quote:date:today"
 ADD_IMAGE_YES = "quote:add_image:yes"
 ADD_IMAGE_NO = "quote:add_image:no"
+ADD_CONTEXT_YES = "quote:add_context:yes"
+ADD_CONTEXT_NO = "quote:add_context:no"
+MAIN_SELECT_PREFIX = "quote:main:"
 NEXT_ADD = "quote:next:add"
+NEXT_MAIN = "quote:next:main"
 NEXT_FINALIZE = "quote:next:finalize"
 NEXT_CANCEL = "quote:next:cancel"
 
@@ -118,16 +125,47 @@ def get_or_create_speaker(name: str, chat_id: int) -> Speaker:
     return speaker
 
 
+def get_unique_speakers_from_quote(quote: Quote) -> list[Speaker]:
+    seen: set[str] = set()
+    unique: list[Speaker] = []
+    for phrase in quote.phrases:
+        if not phrase.speaker:
+            continue
+        key = phrase.speaker.name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(phrase.speaker)
+    return unique
+
+
+def ensure_main_speaker_name(quote: Quote) -> None:
+    unique_speakers = get_unique_speakers_from_quote(quote)
+    if not unique_speakers:
+        quote.main_speaker_name = None
+        return
+
+    if quote.main_speaker_name:
+        current_key = quote.main_speaker_name.casefold()
+        for speaker in unique_speakers:
+            if speaker.name.casefold() == current_key:
+                quote.main_speaker_name = speaker.name
+                return
+
+    quote.main_speaker_name = unique_speakers[0].name
+
+
 def build_quote_signature(quote: Quote) -> tuple:
     phrase_signature = tuple(
         (
             phrase.text,
+            phrase.context_text,
             phrase.speaker.name if phrase.speaker else None,
             phrase.speaker.speaker_image_id if phrase.speaker else None,
         )
         for phrase in quote.phrases
     )
-    return quote.date.isoformat(), phrase_signature
+    return quote.date.isoformat(), quote.main_speaker_name, phrase_signature
 
 
 def bytes_to_image_io(image_bytes: bytes, name: str = "quote.png") -> io.BytesIO:
@@ -206,11 +244,15 @@ def safe_send_photo(chat_id: int | str, photo: io.BytesIO, caption: str | None =
         return None
 
 
-def ensure_quote_exists(message: types.Message) -> Quote | None:
-    quote = get_quote_from_state(message.from_user.id, message.chat.id)
+def ensure_quote_exists_for_session(user_id: int, chat_id: int) -> Quote | None:
+    quote = get_quote_from_state(user_id, chat_id)
     if quote is None:
-        safe_send_message(message.chat.id, "There is no active quote. Use /quote to start one.")
+        safe_send_message(chat_id, "There is no active quote. Use /quote to start one.")
     return quote
+
+
+def ensure_quote_exists(message: types.Message) -> Quote | None:
+    return ensure_quote_exists_for_session(message.from_user.id, message.chat.id)
 
 
 def build_date_keyboard() -> types.InlineKeyboardMarkup:
@@ -228,60 +270,103 @@ def build_add_image_keyboard() -> types.InlineKeyboardMarkup:
     return keyboard
 
 
-def build_next_step_keyboard() -> types.InlineKeyboardMarkup:
-    keyboard = types.InlineKeyboardMarkup(row_width=3)
+def build_add_context_keyboard() -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
+        types.InlineKeyboardButton("Add context", callback_data=ADD_CONTEXT_YES),
+        types.InlineKeyboardButton("Skip", callback_data=ADD_CONTEXT_NO),
+    )
+    return keyboard
+
+
+def build_main_speaker_keyboard(quote: Quote) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    selected_key = quote.main_speaker_name.casefold() if quote.main_speaker_name else None
+
+    for index, speaker in enumerate(get_unique_speakers_from_quote(quote)):
+        label = speaker.name
+        if selected_key and speaker.name.casefold() == selected_key:
+            label = f"⭐ {label}"
+        keyboard.add(types.InlineKeyboardButton(label, callback_data=f"{MAIN_SELECT_PREFIX}{index}"))
+
+    return keyboard
+
+
+def build_next_step_keyboard() -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton("⭐ Main speaker", callback_data=NEXT_MAIN),
         types.InlineKeyboardButton("➕ Add", callback_data=NEXT_ADD),
+    )
+    keyboard.add(
         types.InlineKeyboardButton("✅ Finalize", callback_data=NEXT_FINALIZE),
         types.InlineKeyboardButton("❌ Cancel", callback_data=NEXT_CANCEL),
     )
     return keyboard
 
 
+def prompt_context_for_last_phrase(user_id: int, chat_id: int) -> None:
+    quote = ensure_quote_exists_for_session(user_id, chat_id)
+    if quote is None:
+        return
+
+    bot.set_state(user_id, QuoteState.waiting_for_context_decision, chat_id)
+    safe_send_message(
+        chat_id,
+        "Do you want to add extra context to this phrase?",
+        reply_markup=build_add_context_keyboard(),
+    )
+
+
 def continue_after_speaker_set(message: types.Message) -> None:
-    quote = ensure_quote_exists(message)
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+    quote = ensure_quote_exists_for_session(user_id, chat_id)
     if quote is None:
         return
 
     speaker = quote.phrases[-1].speaker
     if speaker is None:
-        safe_send_message(message.chat.id, "Speaker is missing. Please send the speaker name.")
-        bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
+        safe_send_message(chat_id, "Speaker is missing. Please send the speaker name.")
+        bot.set_state(user_id, SpeakerState.waiting_for_name, chat_id)
         return
 
+    bot.set_state(user_id, SpeakerState.waiting_for_if_add_image_answer, chat_id)
     if speaker.speaker_image_id is None:
-        bot.set_state(message.from_user.id, SpeakerState.waiting_for_if_add_image_answer, message.chat.id)
         safe_send_message(
-            message.chat.id,
+            chat_id,
             f"{speaker.name} has no sticker image yet. Add one?",
             reply_markup=build_add_image_keyboard(),
         )
     else:
-        bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
-        process_speaker_name_end(message)
+        safe_send_message(
+            chat_id,
+            f"{speaker.name} already has a sticker image. Replace it?",
+            reply_markup=build_add_image_keyboard(),
+        )
 
 
-def process_speaker_name_end(message: types.Message) -> None:
-    quote = ensure_quote_exists(message)
+def process_speaker_name_end(user_id: int, chat_id: int) -> None:
+    quote = ensure_quote_exists_for_session(user_id, chat_id)
     if quote is None:
         return
 
     name = quote.phrases[-1].speaker.name if quote.phrases[-1].speaker else "Unknown"
-    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+    bot.set_state(user_id, QuoteState.waiting_for_next_step, chat_id)
 
     try:
-        quote_text, image = get_quote_text_and_image(quote, message.from_user.id, message.chat.id)
+        quote_text, image = get_quote_text_and_image(quote, user_id, chat_id)
     except ApiTelegramException:
-        safe_send_message(message.chat.id, "Failed to build preview because Telegram API request failed.")
+        safe_send_message(chat_id, "Failed to build preview because Telegram API request failed.")
         return
     except Exception:
-        safe_send_message(message.chat.id, "Failed to build preview due to image rendering error.")
+        safe_send_message(chat_id, "Failed to build preview due to image rendering error.")
         return
 
-    safe_send_message(message.chat.id, f"Did {name} really say that? Your quote preview:")
-    safe_send_photo(message.chat.id, photo=image, caption=quote_text)
+    safe_send_message(chat_id, f"Did {name} really say that? Your quote preview:")
+    safe_send_photo(chat_id, photo=image, caption=quote_text)
     safe_send_message(
-        message.chat.id,
+        chat_id,
         "Do you want to add a new phrase or finalize the quote?",
         reply_markup=build_next_step_keyboard(),
     )
@@ -379,6 +464,7 @@ def process_phrase_text(message: types.Message):
         speaker_name = get_speaker_display_name_from_user(message.reply_to_message.from_user)
         speaker = get_or_create_speaker(speaker_name, chat_id=message.chat.id)
         quote.phrases[-1].speaker = speaker
+        ensure_main_speaker_name(quote)
         set_quote_to_state(message.from_user.id, message.chat.id, quote)
 
         safe_send_message(message.chat.id, f"Using replied user as speaker: {speaker.name}")
@@ -417,6 +503,7 @@ def process_speaker_name(message: types.Message):
 
     speaker = get_or_create_speaker(name, chat_id=message.chat.id)
     quote.phrases[-1].speaker = speaker
+    ensure_main_speaker_name(quote)
     set_quote_to_state(message.from_user.id, message.chat.id, quote)
     reset_render_cache(message.from_user.id, message.chat.id)
 
@@ -443,12 +530,11 @@ def process_add_image_callback(call: types.CallbackQuery):
 
     if call.data == ADD_IMAGE_YES:
         bot.set_state(user_id, SpeakerState.waiting_for_speaker_image, chat_id)
-        safe_send_message(chat_id, "Send one sticker for this speaker.")
+        safe_send_message(chat_id, "Send one sticker for this speaker. It will update the speaker image.")
         return
 
-    bot.set_state(user_id, QuoteState.waiting_for_next_step, chat_id)
     safe_send_message(chat_id, "Okay, skipping speaker image.")
-    process_speaker_name_end(call.message)
+    prompt_context_for_last_phrase(user_id, chat_id)
 
 
 @bot.message_handler(state=SpeakerState.waiting_for_if_add_image_answer)
@@ -474,8 +560,8 @@ def process_speaker_image(message: types.Message):
     set_quote_to_state(message.from_user.id, message.chat.id, quote)
     reset_render_cache(message.from_user.id, message.chat.id)
 
-    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
-    process_speaker_name_end(message)
+    safe_send_message(message.chat.id, f"Updated sticker image for {quote.phrases[-1].speaker.name}.")
+    prompt_context_for_last_phrase(message.from_user.id, message.chat.id)
 
 
 @bot.message_handler(state=SpeakerState.waiting_for_speaker_image)
@@ -483,7 +569,122 @@ def process_speaker_image_unknown(message: types.Message):
     safe_send_message(message.chat.id, "Send a sticker, please.")
 
 
-@bot.callback_query_handler(func=lambda call: call.data in (NEXT_ADD, NEXT_FINALIZE, NEXT_CANCEL))
+@bot.callback_query_handler(func=lambda call: call.data in (ADD_CONTEXT_YES, ADD_CONTEXT_NO))
+def process_add_context_callback(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != QuoteState.waiting_for_context_decision.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if call.data == ADD_CONTEXT_YES:
+        bot.set_state(user_id, PhraseState.waiting_for_context_text, chat_id)
+        safe_send_message(chat_id, "Send context text for this phrase.")
+        return
+
+    bot.set_state(user_id, QuoteState.waiting_for_next_step, chat_id)
+    process_speaker_name_end(user_id, chat_id)
+
+
+@bot.message_handler(state=PhraseState.waiting_for_context_text, content_types=["text"])
+def process_phrase_context_text(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    if not quote.phrases:
+        safe_send_message(message.chat.id, "Quote has no phrases yet.")
+        bot.set_state(message.from_user.id, PhraseState.waiting_for_text, message.chat.id)
+        return
+
+    context_text = message.text.strip()
+    if not context_text:
+        safe_send_message(message.chat.id, "Context cannot be empty. Send text or use Skip.")
+        return
+
+    quote.phrases[-1].context_text = context_text
+    set_quote_to_state(message.from_user.id, message.chat.id, quote)
+    reset_render_cache(message.from_user.id, message.chat.id)
+
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
+    process_speaker_name_end(message.from_user.id, message.chat.id)
+
+
+@bot.message_handler(state=PhraseState.waiting_for_context_text)
+def process_phrase_context_non_text(message: types.Message):
+    safe_send_message(message.chat.id, "Please send the context as text.")
+
+
+@bot.message_handler(state=QuoteState.waiting_for_context_decision)
+def process_context_decision_text_fallback(message: types.Message):
+    safe_send_message(
+        message.chat.id,
+        "Use the buttons to choose whether to add context.",
+        reply_markup=build_add_context_keyboard(),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(MAIN_SELECT_PREFIX))
+def process_main_speaker_selection(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != QuoteState.waiting_for_main_speaker.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+    quote = ensure_quote_exists_for_session(user_id, chat_id)
+    if quote is None:
+        return
+
+    unique_speakers = get_unique_speakers_from_quote(quote)
+    if not unique_speakers:
+        safe_send_message(chat_id, "No speakers available. Add at least one phrase with speaker.")
+        bot.set_state(user_id, QuoteState.waiting_for_next_step, chat_id)
+        return
+
+    try:
+        selected_index = int(call.data[len(MAIN_SELECT_PREFIX):])
+    except ValueError:
+        safe_send_message(chat_id, "Invalid speaker selection.")
+        safe_send_message(chat_id, "Choose a main speaker:", reply_markup=build_main_speaker_keyboard(quote))
+        return
+
+    if selected_index < 0 or selected_index >= len(unique_speakers):
+        safe_send_message(chat_id, "Invalid speaker selection.")
+        safe_send_message(chat_id, "Choose a main speaker:", reply_markup=build_main_speaker_keyboard(quote))
+        return
+
+    selected_name = unique_speakers[selected_index].name
+    if quote.main_speaker_name != selected_name:
+        quote.main_speaker_name = selected_name
+        set_quote_to_state(user_id, chat_id, quote)
+        reset_render_cache(user_id, chat_id)
+
+    safe_send_message(chat_id, f"Main speaker set to: {selected_name}")
+    process_speaker_name_end(user_id, chat_id)
+
+
+@bot.message_handler(state=QuoteState.waiting_for_main_speaker)
+def process_main_speaker_text_fallback(message: types.Message):
+    quote = ensure_quote_exists(message)
+    if quote is None:
+        return
+
+    safe_send_message(
+        message.chat.id,
+        "Use the buttons to select the main speaker.",
+        reply_markup=build_main_speaker_keyboard(quote),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data in (NEXT_ADD, NEXT_MAIN, NEXT_FINALIZE, NEXT_CANCEL))
 def process_next_step_callback(call: types.CallbackQuery):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
@@ -494,6 +695,31 @@ def process_next_step_callback(call: types.CallbackQuery):
         return
 
     bot.answer_callback_query(call.id)
+
+    if call.data == NEXT_MAIN:
+        quote = ensure_quote_exists_for_session(user_id, chat_id)
+        if quote is None:
+            return
+
+        previous_main = quote.main_speaker_name
+        ensure_main_speaker_name(quote)
+        if quote.main_speaker_name != previous_main:
+            set_quote_to_state(user_id, chat_id, quote)
+            reset_render_cache(user_id, chat_id)
+
+        unique_speakers = get_unique_speakers_from_quote(quote)
+        if not unique_speakers:
+            safe_send_message(chat_id, "No speakers available. Add at least one phrase with speaker.")
+            return
+
+        if len(unique_speakers) == 1:
+            safe_send_message(chat_id, f"Only one speaker in quote: {unique_speakers[0].name}")
+            process_speaker_name_end(user_id, chat_id)
+            return
+
+        bot.set_state(user_id, QuoteState.waiting_for_main_speaker, chat_id)
+        safe_send_message(chat_id, "Choose the main speaker:", reply_markup=build_main_speaker_keyboard(quote))
+        return
 
     if call.data == NEXT_ADD:
         bot.set_state(user_id, PhraseState.waiting_for_text, chat_id)
@@ -552,6 +778,7 @@ def process_remove_last(message: types.Message):
         return
 
     removed = quote.phrases.pop()
+    ensure_main_speaker_name(quote)
     set_quote_to_state(message.from_user.id, message.chat.id, quote)
     reset_render_cache(message.from_user.id, message.chat.id)
 
@@ -563,7 +790,7 @@ def process_remove_last(message: types.Message):
         return
 
     bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
-    process_speaker_name_end(message)
+    process_speaker_name_end(message.from_user.id, message.chat.id)
 
 
 @bot.message_handler(commands=["edit_last"], state="*")
@@ -583,7 +810,7 @@ def process_edit_last(message: types.Message):
         reset_render_cache(message.from_user.id, message.chat.id)
         bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
         safe_send_message(message.chat.id, "Last phrase updated.")
-        process_speaker_name_end(message)
+        process_speaker_name_end(message.from_user.id, message.chat.id)
         return
 
     bot.set_state(message.from_user.id, PhraseState.waiting_for_edit_last_text, message.chat.id)
@@ -610,7 +837,7 @@ def process_edit_last_text(message: types.Message):
     set_quote_to_state(message.from_user.id, message.chat.id, quote)
     reset_render_cache(message.from_user.id, message.chat.id)
     bot.set_state(message.from_user.id, QuoteState.waiting_for_next_step, message.chat.id)
-    process_speaker_name_end(message)
+    process_speaker_name_end(message.from_user.id, message.chat.id)
 
 
 @bot.message_handler(state=PhraseState.waiting_for_edit_last_text)

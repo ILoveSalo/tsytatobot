@@ -37,14 +37,26 @@ class QuoteTextGenerator:
         if len(quote.phrases) == 1:
             return quote.phrases[0].text
 
-        result = "".join(f"{phrase.speaker.name}: {phrase.text}\n" for phrase in quote.phrases)
-        return f"{result}\n"
+        lines: list[str] = []
+        for phrase in quote.phrases:
+            speaker_name = phrase.speaker.name if phrase.speaker else "Unknown"
+            context = phrase.context_text.strip() if phrase.context_text else ""
+            if context:
+                lines.append(f"{speaker_name} ({context}): {phrase.text}")
+            else:
+                lines.append(f"{speaker_name}: {phrase.text}")
+        return "\n".join(lines)
 
     def generate_quote_with_name(self, quote: Quote) -> str:
         if len(quote.phrases) == 1:
-            return f'"{self.generate_quote(quote)}" - {quote.phrases[0].speaker.name}, '
+            phrase = quote.phrases[0]
+            speaker_name = phrase.speaker.name if phrase.speaker else "Unknown"
+            context = phrase.context_text.strip() if phrase.context_text else ""
+            if context:
+                return f'"{self.generate_quote(quote)}" - {speaker_name} {context}, '
+            return f'"{self.generate_quote(quote)}" - {speaker_name}, '
 
-        return self.generate_quote(quote)
+        return f"{self.generate_quote(quote)}\n"
 
     def generate_quote_with_date(self, quote: Quote) -> str:
         result = self.generate_quote_with_name(quote)

@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from date_parser.date_parser import DateParser
 from domain.quote import Quote
+from domain.speaker import Speaker
 from quote_generator.quote_text_generator import QuoteTextGenerator
 
 
@@ -139,14 +140,56 @@ class QuoteImageGenerator:
 
         return fallback_font, fallback_lines
 
-    def _get_main_speaker_name(self, quote: Quote) -> str:
-        names = [phrase.speaker.name for phrase in quote.phrases if phrase.speaker]
-        if not names:
-            return "Unknown"
+    def _get_main_speaker(self, quote: Quote) -> Speaker | None:
+        speakers = [phrase.speaker for phrase in quote.phrases if phrase.speaker]
+        if not speakers:
+            return None
 
-        counts = Counter(names)
-        # Keep quote order when frequencies are equal.
-        return max(counts, key=lambda name: (counts[name], -names.index(name)))
+        if quote.main_speaker_name:
+            preferred_key = quote.main_speaker_name.casefold()
+            for speaker in speakers:
+                if speaker.name.casefold() == preferred_key:
+                    return speaker
+
+        counts: Counter[str] = Counter()
+        first_index: dict[str, int] = {}
+        for index, speaker in enumerate(speakers):
+            key = speaker.name.casefold()
+            counts[key] += 1
+            if key not in first_index:
+                first_index[key] = index
+
+        best_key = None
+        best_count = -1
+        for key, count in counts.items():
+            if best_key is None:
+                best_key = key
+                best_count = count
+                continue
+            if count > best_count or (count == best_count and first_index[key] < first_index[best_key]):
+                best_key = key
+                best_count = count
+
+        for speaker in speakers:
+            if speaker.name.casefold() == best_key:
+                return speaker
+        return speakers[0]
+
+    def _truncate_text_to_width(
+        self,
+        draw: ImageDraw.ImageDraw,
+        text: str,
+        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        max_width: int,
+    ) -> str:
+        if draw.textlength(text, font=font) <= max_width:
+            return text
+
+        ellipsis = "..."
+        candidate = text
+        while candidate and draw.textlength(f"{candidate}{ellipsis}", font=font) > max_width:
+            candidate = candidate[:-1]
+        return f"{candidate}{ellipsis}" if candidate else ellipsis
 
     def generate_quote_image(self, quote: Quote, images: dict[str, bytes]) -> io.BytesIO:
         canvas = self._base_gradient.copy().convert("RGBA")
@@ -195,9 +238,22 @@ class QuoteImageGenerator:
 
         secondary_font = self._load_font(self._font_path_secondary, 40)
 
-        speaker_name = self._get_main_speaker_name(quote)
+        main_speaker = self._get_main_speaker(quote)
+        speaker_name = main_speaker.name if main_speaker else "Unknown"
         _, speaker_height = draw.textbbox((0, 0), speaker_name, font=secondary_font)[2:]
         draw.text((532, self.CANVAS_HEIGHT - speaker_height - 10), speaker_name, font=secondary_font, fill=(255, 255, 255, 255))
+
+        if len(quote.phrases) == 1 and quote.phrases[0].context_text:
+            context_font = self._load_font(self._font_path_secondary, 24)
+            context_text = quote.phrases[0].context_text.strip()
+            context_text = self._truncate_text_to_width(draw, context_text, context_font, max_width=500)
+            _, context_height = draw.textbbox((0, 0), context_text, font=context_font)[2:]
+            draw.text(
+                (532, self.CANVAS_HEIGHT - speaker_height - context_height - 18),
+                context_text,
+                font=context_font,
+                fill=(230, 230, 230, 255),
+            )
 
         date_text = self.date_parser.parse_date_to_string(quote.date)
         date_width, date_height = draw.textbbox((0, 0), date_text, font=secondary_font)[2:]
@@ -212,7 +268,12 @@ class QuoteImageGenerator:
         canvas = Image.alpha_composite(canvas, quote_layer)
 
         if images:
-            canvas = self.add_main_sticker_to_canvas(next(iter(images.values())), self.CANVAS_HEIGHT, canvas)
+            main_image = None
+            if main_speaker and main_speaker.speaker_image_id:
+                main_image = images.get(main_speaker.speaker_image_id)
+            if main_image is None:
+                main_image = next(iter(images.values()))
+            canvas = self.add_main_sticker_to_canvas(main_image, self.CANVAS_HEIGHT, canvas)
 
         output = io.BytesIO()
         output.name = "sticker_with_text.png"
