@@ -36,7 +36,6 @@ def read_env_variable(env_variable_name: str) -> str:
 
 
 BOT_TOKEN = read_env_variable("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip() or None
 
 STATE_STORAGE_TYPE = os.getenv("STATE_STORAGE", "memory").strip().lower()
 if STATE_STORAGE_TYPE == "pickle":
@@ -64,17 +63,6 @@ def parse_chat_id(value: str) -> int | str:
         return int(value)
     except ValueError:
         return value
-
-
-if CHANNEL_ID and target_repository.get_target(parse_chat_id(CHANNEL_ID)) is None:
-    target_repository.save_target(
-        QuoteTarget(
-            chat_id=parse_chat_id(CHANNEL_ID),
-            title="Legacy channel",
-            type="channel",
-            allow_viewers=False,
-        )
-    )
 
 
 # ------------------ States ------------------
