@@ -13,9 +13,12 @@ from telebot.storage import StateMemoryStorage, StatePickleStorage
 from date_parser.date_parser import DateParser
 from domain.phrase import Phrase
 from domain.quote import Quote
+from domain.quote_target import QuoteTarget
 from domain.speaker import Speaker
 from persistence.impl.local_files.json.json_speaker_repository import JsonSpeakerRepository
+from persistence.impl.local_files.json.json_target_repository import JsonTargetRepository
 from persistence.speaker_repository import SpeakerRepository
+from persistence.target_repository import TargetRepository
 from quote_generator.quote_image_generator import QuoteImageGenerator
 from quote_generator.quote_text_generator import QuoteTextGenerator
 
@@ -33,7 +36,7 @@ def read_env_variable(env_variable_name: str) -> str:
 
 
 BOT_TOKEN = read_env_variable("BOT_TOKEN")
-CHANNEL_ID = read_env_variable("CHANNEL_ID")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip() or None
 
 STATE_STORAGE_TYPE = os.getenv("STATE_STORAGE", "memory").strip().lower()
 if STATE_STORAGE_TYPE == "pickle":
@@ -46,6 +49,7 @@ bot.add_custom_filter(custom_filters.StateFilter(bot))
 bot.setup_middleware(StateMiddleware(bot))
 
 speaker_repository: SpeakerRepository = JsonSpeakerRepository("speakers.json")
+target_repository: TargetRepository = JsonTargetRepository("targets.json")
 
 date_parser = DateParser()
 quote_text_generator = QuoteTextGenerator(date_parser)
@@ -55,9 +59,28 @@ quote_image_generator = QuoteImageGenerator(quote_text_generator, date_parser)
 sticker_file_cache: dict[str, bytes] = {}
 
 
+def parse_chat_id(value: str) -> int | str:
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+if CHANNEL_ID and target_repository.get_target(parse_chat_id(CHANNEL_ID)) is None:
+    target_repository.save_target(
+        QuoteTarget(
+            chat_id=parse_chat_id(CHANNEL_ID),
+            title="Legacy channel",
+            type="channel",
+            allow_viewers=False,
+        )
+    )
+
+
 # ------------------ States ------------------
 
 class QuoteState(StatesGroup):
+    waiting_for_target = State()
     waiting_for_date = State()
     waiting_for_phrase_image_selection = State()
     waiting_for_speaker_image_decision = State()
@@ -78,6 +101,7 @@ class SpeakerState(StatesGroup):
 
 
 class SpeakerEditState(StatesGroup):
+    waiting_for_target = State()
     waiting_for_speaker_name = State()
     waiting_for_action = State()
     waiting_for_new_name = State()
@@ -86,6 +110,13 @@ class SpeakerEditState(StatesGroup):
 
 # ------------------ Callback data ------------------
 
+QUOTE_TARGET_PREFIX = "quote:target:"
+QUOTE_TARGET_CANCEL = "quote:target:cancel"
+SETTINGS_TARGET_PREFIX = "target_settings:target:"
+SETTINGS_TOGGLE_VIEWERS_PREFIX = "target_settings:toggle_viewers:"
+SETTINGS_DONE = "target_settings:done"
+EDIT_TARGET_PREFIX = "edit_speaker:target:"
+EDIT_TARGET_CANCEL = "edit_speaker:target:cancel"
 DATE_TODAY = "quote:date:today"
 PHRASE_IMAGE_PREFIX = "quote:phrase_image:"
 PHRASE_IMAGE_NONE = "quote:phrase_image:none"
@@ -110,6 +141,9 @@ EDIT_SELECT_CANCEL = "edit_speaker:select:cancel"
 EDIT_SET_PRIMARY_PREFIX = "edit_speaker:set_primary:"
 EDIT_REMOVE_IMAGE_PREFIX = "edit_speaker:remove_image:"
 
+ADD_GROUP_TARGET_REQUEST_ID = 1001
+ADD_CHANNEL_TARGET_REQUEST_ID = 1002
+
 
 # ------------------ Utils ------------------
 
@@ -128,9 +162,52 @@ def set_quote_to_state(user_id: int, chat_id: int, quote: Quote) -> None:
     bot.add_data(user_id, chat_id, quote=quote)
 
 
+def set_quote_target_to_state(user_id: int, chat_id: int, target_chat_id: int | str) -> None:
+    bot.add_data(user_id, chat_id, target_chat_id=target_chat_id)
+
+
+def get_quote_target_chat_id_from_state(user_id: int, chat_id: int) -> int | str | None:
+    with bot.retrieve_data(user_id, chat_id) as data:
+        return data.get("target_chat_id")
+
+
+def get_quote_target_from_state(user_id: int, chat_id: int) -> QuoteTarget | None:
+    target_chat_id = get_quote_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        return None
+    return target_repository.get_target(target_chat_id)
+
+
 def clear_edit_speaker_state_data(user_id: int, chat_id: int) -> None:
     with bot.retrieve_data(user_id, chat_id) as data:
         data.pop("edit_speaker_name", None)
+        data.pop("edit_target_chat_id", None)
+        data.pop("pending_edit_speaker_name", None)
+
+
+def set_edit_target_to_state(user_id: int, chat_id: int, target_chat_id: int | str) -> None:
+    bot.add_data(user_id, chat_id, edit_target_chat_id=target_chat_id)
+
+
+def get_edit_target_chat_id_from_state(user_id: int, chat_id: int) -> int | str | None:
+    with bot.retrieve_data(user_id, chat_id) as data:
+        return data.get("edit_target_chat_id")
+
+
+def get_edit_target_from_state(user_id: int, chat_id: int) -> QuoteTarget | None:
+    target_chat_id = get_edit_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        return None
+    return target_repository.get_target(target_chat_id)
+
+
+def set_pending_edit_speaker_name_to_state(user_id: int, chat_id: int, speaker_name: str | None) -> None:
+    bot.add_data(user_id, chat_id, pending_edit_speaker_name=speaker_name)
+
+
+def get_pending_edit_speaker_name_from_state(user_id: int, chat_id: int) -> str | None:
+    with bot.retrieve_data(user_id, chat_id) as data:
+        return data.get("pending_edit_speaker_name")
 
 
 def set_edit_speaker_name_to_state(user_id: int, chat_id: int, speaker_name: str) -> None:
@@ -146,7 +223,58 @@ def get_edit_speaker_from_state(user_id: int, chat_id: int) -> Speaker | None:
     speaker_name = get_edit_speaker_name_from_state(user_id, chat_id)
     if not speaker_name:
         return None
-    return speaker_repository.get_speaker(speaker_name, chat_id=chat_id)
+    target_chat_id = get_edit_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        return None
+    return speaker_repository.get_speaker(speaker_name, chat_id=target_chat_id)
+
+
+def get_quote_speaker_scope_chat_id(user_id: int, chat_id: int) -> int | str:
+    return get_quote_target_chat_id_from_state(user_id, chat_id) or chat_id
+
+
+def target_label(target: QuoteTarget) -> str:
+    type_label = "channel" if target.is_channel else "group"
+    return f"{target.title} ({type_label})"
+
+
+def get_chat_member_status(chat_id: int | str, user_id: int) -> str | None:
+    try:
+        return bot.get_chat_member(chat_id, user_id).status
+    except ApiTelegramException:
+        return None
+
+
+def is_target_admin(target: QuoteTarget, user_id: int) -> bool:
+    return get_chat_member_status(target.chat_id, user_id) in ("creator", "administrator")
+
+
+def can_user_use_target(target: QuoteTarget, user_id: int) -> bool:
+    status = get_chat_member_status(target.chat_id, user_id)
+    if status is None:
+        return False
+
+    if target.is_group:
+        return status in ("creator", "administrator", "member")
+
+    if target.is_channel:
+        if status in ("creator", "administrator"):
+            return True
+        return target.allow_viewers and status == "member"
+
+    return False
+
+
+def get_accessible_targets(user_id: int) -> list[QuoteTarget]:
+    return [target for target in target_repository.get_targets() if can_user_use_target(target, user_id)]
+
+
+def get_admin_targets(user_id: int) -> list[QuoteTarget]:
+    return [target for target in target_repository.get_targets() if is_target_admin(target, user_id)]
+
+
+def get_registered_current_chat_target(chat_id: int) -> QuoteTarget | None:
+    return target_repository.get_target(chat_id)
 
 
 def get_speaker_display_name_from_user(user: types.User) -> str:
@@ -156,7 +284,7 @@ def get_speaker_display_name_from_user(user: types.User) -> str:
     return user.username or str(user.id)
 
 
-def get_or_create_speaker(name: str, chat_id: int) -> Speaker:
+def get_or_create_speaker(name: str, chat_id: int | str) -> Speaker:
     normalized_name = " ".join(name.split()).strip()
     existing = speaker_repository.get_speaker(normalized_name, chat_id=chat_id)
     if existing:
@@ -304,6 +432,93 @@ def ensure_quote_exists(message: types.Message) -> Quote | None:
 def build_date_keyboard() -> types.InlineKeyboardMarkup:
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("📅 Today", callback_data=DATE_TODAY))
+    return keyboard
+
+
+def build_target_keyboard(targets: list[QuoteTarget], callback_prefix: str, cancel_callback: str) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for index, target in enumerate(targets):
+        keyboard.add(types.InlineKeyboardButton(target_label(target), callback_data=f"{callback_prefix}{index}"))
+    keyboard.add(types.InlineKeyboardButton("Cancel", callback_data=cancel_callback))
+    return keyboard
+
+
+def build_target_settings_keyboard(target: QuoteTarget) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if target.is_channel:
+        label = "Disable viewers" if target.allow_viewers else "Allow viewers"
+        keyboard.add(
+            types.InlineKeyboardButton(
+                label,
+                callback_data=f"{SETTINGS_TOGGLE_VIEWERS_PREFIX}{target.key}",
+            )
+        )
+    keyboard.add(types.InlineKeyboardButton("Done", callback_data=SETTINGS_DONE))
+    return keyboard
+
+
+def build_add_target_keyboard() -> types.ReplyKeyboardMarkup:
+    group_admin_rights = types.ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=False,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_invite_users=False,
+    )
+    channel_admin_rights = types.ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=False,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_invite_users=False,
+        can_post_messages=True,
+    )
+    channel_bot_rights = types.ChatAdministratorRights(
+        is_anonymous=False,
+        can_manage_chat=True,
+        can_delete_messages=False,
+        can_manage_video_chats=False,
+        can_restrict_members=False,
+        can_promote_members=False,
+        can_change_info=False,
+        can_invite_users=False,
+        can_post_messages=True,
+    )
+
+    keyboard = types.ReplyKeyboardMarkup(row_width=1, one_time_keyboard=True, resize_keyboard=True)
+    keyboard.add(
+        types.KeyboardButton(
+            "Add group",
+            request_chat=types.KeyboardButtonRequestChat(
+                request_id=ADD_GROUP_TARGET_REQUEST_ID,
+                chat_is_channel=False,
+                user_administrator_rights=group_admin_rights,
+                bot_is_member=True,
+                request_title=True,
+                request_username=True,
+            ),
+        )
+    )
+    keyboard.add(
+        types.KeyboardButton(
+            "Add channel",
+            request_chat=types.KeyboardButtonRequestChat(
+                request_id=ADD_CHANNEL_TARGET_REQUEST_ID,
+                chat_is_channel=True,
+                user_administrator_rights=channel_admin_rights,
+                bot_administrator_rights=channel_bot_rights,
+                bot_is_member=True,
+                request_title=True,
+                request_username=True,
+            ),
+        )
+    )
     return keyboard
 
 
@@ -467,20 +682,69 @@ def prompt_edit_speaker_actions(user_id: int, chat_id: int, speaker: Speaker) ->
     )
 
 
-def prompt_edit_speaker_selection(user_id: int, chat_id: int, intro: str = "Choose speaker to edit:") -> None:
-    speakers = speaker_repository.get_speakers(chat_id=chat_id)
+def prompt_edit_speaker_selection(user_id: int, chat_id: int, target: QuoteTarget, intro: str = "Choose speaker to edit:") -> None:
+    set_edit_target_to_state(user_id, chat_id, target.chat_id)
+    speakers = speaker_repository.get_speakers(chat_id=target.chat_id)
     if not speakers:
         bot.delete_state(user_id, chat_id)
         clear_edit_speaker_state_data(user_id, chat_id)
-        safe_send_message(chat_id, "No speakers found in this chat yet.")
+        safe_send_message(chat_id, f"No speakers found for {target_label(target)} yet.")
         return
 
     bot.set_state(user_id, SpeakerEditState.waiting_for_speaker_name, chat_id)
     safe_send_message(
         chat_id,
-        intro,
+        f"{intro}\nTarget: {target_label(target)}",
         reply_markup=build_edit_speaker_selection_keyboard(speakers),
     )
+
+
+def prompt_edit_target_selection(user_id: int, chat_id: int, pending_speaker_name: str | None = None) -> None:
+    if pending_speaker_name:
+        set_pending_edit_speaker_name_to_state(user_id, chat_id, pending_speaker_name)
+
+    current_target = get_registered_current_chat_target(chat_id)
+    if current_target and can_user_use_target(current_target, user_id):
+        handle_edit_target_selected(user_id, chat_id, current_target)
+        return
+
+    targets = get_accessible_targets(user_id)
+    if not targets:
+        bot.delete_state(user_id, chat_id)
+        clear_edit_speaker_state_data(user_id, chat_id)
+        safe_send_message(chat_id, "No available quote targets. Use /add_target first.")
+        return
+
+    if len(targets) == 1:
+        handle_edit_target_selected(user_id, chat_id, targets[0])
+        return
+
+    bot.set_state(user_id, SpeakerEditState.waiting_for_target, chat_id)
+    safe_send_message(
+        chat_id,
+        "Choose target whose speakers you want to edit:",
+        reply_markup=build_target_keyboard(targets, EDIT_TARGET_PREFIX, EDIT_TARGET_CANCEL),
+    )
+
+
+def handle_edit_target_selected(user_id: int, chat_id: int, target: QuoteTarget) -> None:
+    set_edit_target_to_state(user_id, chat_id, target.chat_id)
+    pending_speaker_name = get_pending_edit_speaker_name_from_state(user_id, chat_id)
+    if pending_speaker_name:
+        set_pending_edit_speaker_name_to_state(user_id, chat_id, None)
+        speaker = speaker_repository.get_speaker(pending_speaker_name, chat_id=target.chat_id)
+        if speaker is None:
+            prompt_edit_speaker_selection(
+                user_id,
+                chat_id,
+                target,
+                intro=f"Speaker '{pending_speaker_name}' not found. Choose speaker to edit:",
+            )
+            return
+        prompt_edit_speaker_actions(user_id, chat_id, speaker)
+        return
+
+    prompt_edit_speaker_selection(user_id, chat_id, target)
 
 
 def continue_after_speaker_set(message: types.Message) -> None:
@@ -525,11 +789,31 @@ def process_speaker_name_end(user_id: int, chat_id: int) -> None:
     )
 
 
+def prompt_quote_date(user_id: int, chat_id: int, target: QuoteTarget) -> None:
+    safe_send_message(chat_id, f"Creating quote for {target_label(target)}.")
+    safe_send_message(
+        chat_id,
+        "When did you hear these words? Send date as dd.mm.yyyy or use the button.",
+        reply_markup=build_date_keyboard(),
+    )
+    bot.set_state(user_id, QuoteState.waiting_for_date, chat_id)
+
+
 def finalize_quote(user_id: int, chat_id: int) -> None:
     quote = get_quote_from_state(user_id, chat_id)
     if quote is None:
         safe_send_message(chat_id, "There is no active quote. Use /quote.")
         clear_session(user_id, chat_id)
+        return
+
+    target = get_quote_target_from_state(user_id, chat_id)
+    if target is None:
+        safe_send_message(chat_id, "No quote target selected. Use /quote to start again.")
+        clear_session(user_id, chat_id)
+        return
+
+    if not can_user_use_target(target, user_id):
+        safe_send_message(chat_id, f"You are not allowed to post quotes to {target_label(target)}.")
         return
 
     try:
@@ -538,12 +822,12 @@ def finalize_quote(user_id: int, chat_id: int) -> None:
         safe_send_message(chat_id, "Failed to finalize quote because preview data is unavailable.")
         return
 
-    channel_message = safe_send_photo(CHANNEL_ID, photo=image, caption=quote_text)
-    if channel_message is None:
-        safe_send_message(chat_id, "Failed to post in channel. Check bot permissions and CHANNEL_ID.")
+    target_message = safe_send_photo(target.chat_id, photo=image, caption=quote_text)
+    if target_message is None:
+        safe_send_message(chat_id, f"Failed to post in {target_label(target)}. Check bot permissions.")
         return
 
-    safe_send_message(chat_id, "Done.", reply_markup=types.ReplyKeyboardRemove())
+    safe_send_message(chat_id, f"Done. Posted to {target_label(target)}.", reply_markup=types.ReplyKeyboardRemove())
     clear_session(user_id, chat_id)
 
 
@@ -552,13 +836,200 @@ def finalize_quote(user_id: int, chat_id: int) -> None:
 @bot.message_handler(commands=["quote"])
 def create_quote(message: types.Message):
     clear_session(message.from_user.id, message.chat.id)
-    safe_send_message(message.chat.id, "Let\'s create a new quote.")
+    targets = get_accessible_targets(message.from_user.id)
+    if not targets:
+        safe_send_message(message.chat.id, "No available quote targets. Use /add_target first.")
+        return
+
+    bot.set_state(message.from_user.id, QuoteState.waiting_for_target, message.chat.id)
     safe_send_message(
         message.chat.id,
-        "When did you hear these words? Send date as dd.mm.yyyy or use the button.",
-        reply_markup=build_date_keyboard(),
+        "Choose where to post this quote:",
+        reply_markup=build_target_keyboard(targets, QUOTE_TARGET_PREFIX, QUOTE_TARGET_CANCEL),
     )
-    bot.set_state(message.from_user.id, QuoteState.waiting_for_date, message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(QUOTE_TARGET_PREFIX) or call.data == QUOTE_TARGET_CANCEL)
+def process_quote_target_selection(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != QuoteState.waiting_for_target.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if call.data == QUOTE_TARGET_CANCEL:
+        clear_session(user_id, chat_id)
+        safe_send_message(chat_id, "Cancelled.", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    try:
+        selected_index = int(call.data[len(QUOTE_TARGET_PREFIX):])
+    except ValueError:
+        safe_send_message(chat_id, "Invalid target selection.")
+        return
+
+    targets = get_accessible_targets(user_id)
+    if selected_index < 0 or selected_index >= len(targets):
+        safe_send_message(chat_id, "Invalid target selection.")
+        return
+
+    target = targets[selected_index]
+    set_quote_target_to_state(user_id, chat_id, target.chat_id)
+    prompt_quote_date(user_id, chat_id, target)
+
+
+@bot.message_handler(commands=["add_target"])
+def process_add_target_command(message: types.Message):
+    safe_send_message(
+        message.chat.id,
+        "Choose a group or channel to register. You must be an admin there, and the bot must be able to post.",
+        reply_markup=build_add_target_keyboard(),
+    )
+
+
+@bot.message_handler(content_types=["chat_shared"])
+def process_chat_shared(message: types.Message):
+    shared = message.chat_shared
+    if shared.request_id not in (ADD_GROUP_TARGET_REQUEST_ID, ADD_CHANNEL_TARGET_REQUEST_ID):
+        return
+
+    fallback_type = "channel" if shared.request_id == ADD_CHANNEL_TARGET_REQUEST_ID else "supergroup"
+    fallback_title = shared.title or shared.username or str(shared.chat_id)
+
+    try:
+        chat = bot.get_chat(shared.chat_id)
+        chat_type = getattr(chat, "type", None) or fallback_type
+        title = getattr(chat, "title", None) or fallback_title
+    except ApiTelegramException:
+        chat_type = fallback_type
+        title = fallback_title
+
+    existing_target = target_repository.get_target(shared.chat_id)
+    target = QuoteTarget(
+        chat_id=shared.chat_id,
+        title=title,
+        type=chat_type,
+        allow_viewers=existing_target.allow_viewers if existing_target else False,
+        registered_by_user_id=message.from_user.id,
+        registered_at=existing_target.registered_at if existing_target else datetime.now().isoformat(timespec="seconds"),
+    )
+
+    if not is_target_admin(target, message.from_user.id):
+        safe_send_message(
+            message.chat.id,
+            "Could not verify that you are an admin in that target. Add the bot there and try again.",
+            reply_markup=types.ReplyKeyboardRemove(),
+        )
+        return
+
+    target_repository.save_target(target)
+    safe_send_message(
+        message.chat.id,
+        f"Registered {target_label(target)}.",
+        reply_markup=types.ReplyKeyboardRemove(),
+    )
+
+
+@bot.message_handler(commands=["targets"])
+def process_targets_command(message: types.Message):
+    targets = get_accessible_targets(message.from_user.id)
+    if not targets:
+        safe_send_message(message.chat.id, "No available quote targets. Use /add_target first.")
+        return
+
+    lines = ["Available quote targets:"]
+    for target in targets:
+        access = "viewers allowed" if target.is_channel and target.allow_viewers else "admins only" if target.is_channel else "members allowed"
+        lines.append(f"- {target_label(target)}: {access}")
+
+    safe_send_message(message.chat.id, "\n".join(lines))
+
+
+@bot.message_handler(commands=["target_settings"])
+def process_target_settings_command(message: types.Message):
+    targets = get_admin_targets(message.from_user.id)
+    if not targets:
+        safe_send_message(message.chat.id, "No targets where you are an admin were found.")
+        return
+
+    safe_send_message(
+        message.chat.id,
+        "Choose target settings:",
+        reply_markup=build_target_keyboard(targets, SETTINGS_TARGET_PREFIX, SETTINGS_DONE),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(SETTINGS_TARGET_PREFIX) or call.data == SETTINGS_DONE)
+def process_target_settings_selection(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+
+    bot.answer_callback_query(call.id)
+
+    if call.data == SETTINGS_DONE:
+        safe_send_message(chat_id, "Target settings closed.")
+        return
+
+    try:
+        selected_index = int(call.data[len(SETTINGS_TARGET_PREFIX):])
+    except ValueError:
+        safe_send_message(chat_id, "Invalid target selection.")
+        return
+
+    targets = get_admin_targets(user_id)
+    if selected_index < 0 or selected_index >= len(targets):
+        safe_send_message(chat_id, "Invalid target selection.")
+        return
+
+    target = targets[selected_index]
+    if not target.is_channel:
+        safe_send_message(chat_id, f"{target_label(target)} uses member access by default.")
+        return
+
+    status = "enabled" if target.allow_viewers else "disabled"
+    safe_send_message(
+        chat_id,
+        f"Viewer access for {target_label(target)} is currently {status}.",
+        reply_markup=build_target_settings_keyboard(target),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(SETTINGS_TOGGLE_VIEWERS_PREFIX))
+def process_target_settings_toggle_viewers(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    target_key = call.data[len(SETTINGS_TOGGLE_VIEWERS_PREFIX):]
+    target = target_repository.get_target(target_key)
+
+    bot.answer_callback_query(call.id)
+
+    if target is None:
+        safe_send_message(chat_id, "Target not found.")
+        return
+
+    if not target.is_channel:
+        safe_send_message(chat_id, "Viewer access can only be changed for channels.")
+        return
+
+    if not is_target_admin(target, user_id):
+        safe_send_message(chat_id, "Only target admins can change this setting.")
+        return
+
+    updated = target_repository.set_allow_viewers(target.chat_id, not target.allow_viewers)
+    if updated is None:
+        safe_send_message(chat_id, "Target not found.")
+        return
+
+    status = "enabled" if updated.allow_viewers else "disabled"
+    safe_send_message(
+        chat_id,
+        f"Viewer access for {target_label(updated)} is now {status}.",
+        reply_markup=build_target_settings_keyboard(updated),
+    )
 
 
 @bot.callback_query_handler(func=lambda call: call.data == DATE_TODAY)
@@ -603,6 +1074,7 @@ def process_phrase_text(message: types.Message):
     quote = ensure_quote_exists(message)
     if quote is None:
         return
+    speaker_scope_chat_id = get_quote_speaker_scope_chat_id(message.from_user.id, message.chat.id)
 
     text = message.text.strip()
     if not text:
@@ -615,7 +1087,7 @@ def process_phrase_text(message: types.Message):
 
     if message.reply_to_message and message.reply_to_message.from_user:
         speaker_name = get_speaker_display_name_from_user(message.reply_to_message.from_user)
-        speaker = get_or_create_speaker(speaker_name, chat_id=message.chat.id)
+        speaker = get_or_create_speaker(speaker_name, chat_id=speaker_scope_chat_id)
         quote.phrases[-1].speaker = speaker
         ensure_main_speaker_name(quote)
         set_quote_to_state(message.from_user.id, message.chat.id, quote)
@@ -626,7 +1098,7 @@ def process_phrase_text(message: types.Message):
 
     bot.set_state(message.from_user.id, SpeakerState.waiting_for_name, message.chat.id)
 
-    speakers = [speaker.name for speaker in speaker_repository.get_speakers(chat_id=message.chat.id)]
+    speakers = [speaker.name for speaker in speaker_repository.get_speakers(chat_id=speaker_scope_chat_id)]
     keyboard = types.ReplyKeyboardMarkup(row_width=2, one_time_keyboard=True, resize_keyboard=True)
     for name in speakers[:30]:
         keyboard.add(types.KeyboardButton(name))
@@ -648,13 +1120,14 @@ def process_speaker_name(message: types.Message):
     quote = ensure_quote_exists(message)
     if quote is None:
         return
+    speaker_scope_chat_id = get_quote_speaker_scope_chat_id(message.from_user.id, message.chat.id)
 
     name = message.text.strip()
     if not name:
         safe_send_message(message.chat.id, "Speaker name cannot be empty.")
         return
 
-    speaker = get_or_create_speaker(name, chat_id=message.chat.id)
+    speaker = get_or_create_speaker(name, chat_id=speaker_scope_chat_id)
     quote.phrases[-1].speaker = speaker
     ensure_main_speaker_name(quote)
     set_quote_to_state(message.from_user.id, message.chat.id, quote)
@@ -668,39 +1141,70 @@ def process_speaker_name(message: types.Message):
 def process_speaker_name_non_text(message: types.Message):
     safe_send_message(message.chat.id, "Please send the speaker name as text.")
 
-@bot.message_handler(commands=["editspeaker"])
+@bot.message_handler(commands=["edit_speaker", "editspeaker"])
 def process_edit_speaker_command(message: types.Message):
     clear_edit_speaker_state_data(message.from_user.id, message.chat.id)
 
     command_parts = message.text.split(maxsplit=1)
     if len(command_parts) == 2 and command_parts[1].strip():
-        speaker_name = command_parts[1].strip()
-        speaker = speaker_repository.get_speaker(speaker_name, chat_id=message.chat.id)
-        if speaker is None:
-            prompt_edit_speaker_selection(
-                message.from_user.id,
-                message.chat.id,
-                intro=f"Speaker '{speaker_name}' not found. Choose speaker to edit:",
-            )
-            return
-        prompt_edit_speaker_actions(message.from_user.id, message.chat.id, speaker)
+        prompt_edit_target_selection(message.from_user.id, message.chat.id, pending_speaker_name=command_parts[1].strip())
         return
 
-    prompt_edit_speaker_selection(message.from_user.id, message.chat.id)
+    prompt_edit_target_selection(message.from_user.id, message.chat.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith(EDIT_TARGET_PREFIX) or call.data == EDIT_TARGET_CANCEL)
+def process_edit_target_selection(call: types.CallbackQuery):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    state = bot.get_state(user_id, chat_id)
+
+    if state != SpeakerEditState.waiting_for_target.name:
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id)
+
+    if call.data == EDIT_TARGET_CANCEL:
+        bot.delete_state(user_id, chat_id)
+        clear_edit_speaker_state_data(user_id, chat_id)
+        safe_send_message(chat_id, "Speaker edit cancelled.", reply_markup=types.ReplyKeyboardRemove())
+        return
+
+    try:
+        selected_index = int(call.data[len(EDIT_TARGET_PREFIX):])
+    except ValueError:
+        safe_send_message(chat_id, "Invalid target selection.")
+        prompt_edit_target_selection(user_id, chat_id)
+        return
+
+    targets = get_accessible_targets(user_id)
+    if selected_index < 0 or selected_index >= len(targets):
+        safe_send_message(chat_id, "Invalid target selection.")
+        prompt_edit_target_selection(user_id, chat_id)
+        return
+
+    handle_edit_target_selected(user_id, chat_id, targets[selected_index])
 
 
 @bot.message_handler(state=SpeakerEditState.waiting_for_speaker_name, content_types=["text"])
 def process_edit_speaker_name(message: types.Message):
+    target = get_edit_target_from_state(message.from_user.id, message.chat.id)
+    if target is None:
+        prompt_edit_target_selection(message.from_user.id, message.chat.id, pending_speaker_name=message.text.strip())
+        return
+
     speaker_name = message.text.strip()
     if not speaker_name:
         safe_send_message(message.chat.id, "Speaker name cannot be empty.")
         return
 
-    speaker = speaker_repository.get_speaker(speaker_name, chat_id=message.chat.id)
+    speaker = speaker_repository.get_speaker(speaker_name, chat_id=target.chat_id)
     if speaker is None:
         prompt_edit_speaker_selection(
             message.from_user.id,
             message.chat.id,
+            target,
             intro=f"Speaker '{speaker_name}' not found. Choose speaker to edit:",
         )
         return
@@ -710,9 +1214,14 @@ def process_edit_speaker_name(message: types.Message):
 
 @bot.message_handler(state=SpeakerEditState.waiting_for_speaker_name)
 def process_edit_speaker_name_non_text(message: types.Message):
-    speakers = speaker_repository.get_speakers(chat_id=message.chat.id)
+    target = get_edit_target_from_state(message.from_user.id, message.chat.id)
+    if target is None:
+        prompt_edit_target_selection(message.from_user.id, message.chat.id)
+        return
+
+    speakers = speaker_repository.get_speakers(chat_id=target.chat_id)
     if not speakers:
-        safe_send_message(message.chat.id, "No speakers found in this chat yet.")
+        safe_send_message(message.chat.id, f"No speakers found for {target_label(target)} yet.")
         return
 
     safe_send_message(
@@ -744,13 +1253,20 @@ def process_edit_speaker_selection(call: types.CallbackQuery):
         selected_index = int(call.data[len(EDIT_SELECT_PREFIX):])
     except ValueError:
         safe_send_message(chat_id, "Invalid speaker selection.")
-        prompt_edit_speaker_selection(user_id, chat_id)
+        target = get_edit_target_from_state(user_id, chat_id)
+        if target:
+            prompt_edit_speaker_selection(user_id, chat_id, target)
         return
 
-    speakers = speaker_repository.get_speakers(chat_id=chat_id)
+    target = get_edit_target_from_state(user_id, chat_id)
+    if target is None:
+        safe_send_message(chat_id, "No target selected. Use /edit_speaker again.")
+        return
+
+    speakers = speaker_repository.get_speakers(chat_id=target.chat_id)
     if selected_index < 0 or selected_index >= len(speakers):
         safe_send_message(chat_id, "Invalid speaker selection.")
-        prompt_edit_speaker_selection(user_id, chat_id)
+        prompt_edit_speaker_selection(user_id, chat_id, target)
         return
 
     prompt_edit_speaker_actions(user_id, chat_id, speakers[selected_index])
@@ -845,7 +1361,12 @@ def process_edit_speaker_new_name(message: types.Message):
         safe_send_message(chat_id, "New name cannot be empty.")
         return
 
-    renamed = speaker_repository.rename_speaker(speaker.name, new_name, chat_id=chat_id)
+    target_chat_id = get_edit_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        safe_send_message(chat_id, "No target selected. Use /edit_speaker again.")
+        return
+
+    renamed = speaker_repository.rename_speaker(speaker.name, new_name, chat_id=target_chat_id)
     if renamed is None:
         safe_send_message(chat_id, "Failed to rename speaker.")
         prompt_edit_speaker_actions(user_id, chat_id, speaker)
@@ -872,7 +1393,11 @@ def process_edit_speaker_new_image(message: types.Message):
         return
 
     speaker.add_image_id(message.sticker.file_id)
-    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    target_chat_id = get_edit_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        safe_send_message(chat_id, "No target selected. Use /edit_speaker again.")
+        return
+    speaker_repository.save_speaker(speaker, chat_id=target_chat_id)
     safe_send_message(chat_id, f"Image added to '{speaker.name}'.")
     prompt_edit_speaker_actions(user_id, chat_id, speaker)
 
@@ -910,7 +1435,11 @@ def process_edit_speaker_set_primary(call: types.CallbackQuery):
 
     selected_image = speaker.speaker_image_ids[selected_index]
     speaker.speaker_image_ids = [selected_image] + [image_id for image_id in speaker.speaker_image_ids if image_id != selected_image]
-    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    target_chat_id = get_edit_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        safe_send_message(chat_id, "No target selected. Use /edit_speaker again.")
+        return
+    speaker_repository.save_speaker(speaker, chat_id=target_chat_id)
     safe_send_message(chat_id, f"Primary image updated for '{speaker.name}'.")
     prompt_edit_speaker_actions(user_id, chat_id, speaker)
 
@@ -942,7 +1471,11 @@ def process_edit_speaker_remove_image(call: types.CallbackQuery):
         return
 
     removed_image = speaker.speaker_image_ids.pop(selected_index)
-    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    target_chat_id = get_edit_target_chat_id_from_state(user_id, chat_id)
+    if target_chat_id is None:
+        safe_send_message(chat_id, "No target selected. Use /edit_speaker again.")
+        return
+    speaker_repository.save_speaker(speaker, chat_id=target_chat_id)
     # Best-effort local cache cleanup.
     sticker_file_cache.pop(removed_image, None)
     safe_send_message(chat_id, f"Image removed from '{speaker.name}'.")
@@ -1012,7 +1545,7 @@ def process_add_speaker_image_sticker(message: types.Message):
     image_id = message.sticker.file_id
 
     speaker.add_image_id(image_id)
-    speaker_repository.save_speaker(speaker, chat_id=chat_id)
+    speaker_repository.save_speaker(speaker, chat_id=get_quote_speaker_scope_chat_id(user_id, chat_id))
     phrase.speaker_image_id = image_id
     set_quote_to_state(user_id, chat_id, quote)
     reset_render_cache(user_id, chat_id)
@@ -1254,7 +1787,7 @@ def process_next_step_text_fallback(message: types.Message):
     )
 
 
-@bot.message_handler(commands=["preview"], state="*")
+@bot.message_handler(commands=["preview"])
 def process_preview_command(message: types.Message):
     quote = ensure_quote_exists(message)
     if quote is None:
@@ -1269,7 +1802,7 @@ def process_preview_command(message: types.Message):
     safe_send_photo(message.chat.id, photo=image, caption=quote_text)
 
 
-@bot.message_handler(commands=["done"], state="*")
+@bot.message_handler(commands=["done"])
 def process_done_command(message: types.Message):
     if bot.get_state(message.from_user.id, message.chat.id) != QuoteState.waiting_for_next_step.name:
         safe_send_message(message.chat.id, "Use /done after at least one complete phrase with speaker.")
@@ -1278,7 +1811,7 @@ def process_done_command(message: types.Message):
     finalize_quote(user_id=message.from_user.id, chat_id=message.chat.id)
 
 
-@bot.message_handler(commands=["remove_last"], state="*")
+@bot.message_handler(commands=["remove_last"])
 def process_remove_last(message: types.Message):
     quote = ensure_quote_exists(message)
     if quote is None:
@@ -1304,7 +1837,7 @@ def process_remove_last(message: types.Message):
     process_speaker_name_end(message.from_user.id, message.chat.id)
 
 
-@bot.message_handler(commands=["edit_last"], state="*")
+@bot.message_handler(commands=["edit_last"])
 def process_edit_last(message: types.Message):
     quote = ensure_quote_exists(message)
     if quote is None:
@@ -1356,7 +1889,7 @@ def process_edit_last_text_non_text(message: types.Message):
     safe_send_message(message.chat.id, "Send text for the updated phrase.")
 
 
-@bot.message_handler(commands=["cancel"], state="*")
+@bot.message_handler(commands=["cancel"])
 def process_cancel(message: types.Message):
     clear_session(message.from_user.id, message.chat.id)
     safe_send_message(message.chat.id, "Cancelled.", reply_markup=types.ReplyKeyboardRemove())

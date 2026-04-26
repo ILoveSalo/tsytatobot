@@ -23,7 +23,7 @@ class JsonSpeakerRepository(SpeakerRepository):
         self._index_by_chat: dict[str, dict[str, Speaker]] = defaultdict(dict)
         self._load()
 
-    def _chat_key(self, chat_id: int | None) -> str:
+    def _chat_key(self, chat_id: int | str | None) -> str:
         return str(chat_id) if chat_id is not None else GLOBAL_CHAT_KEY
 
     def _unique_image_ids(self, image_ids: list[str]) -> list[str]:
@@ -108,12 +108,12 @@ class JsonSpeakerRepository(SpeakerRepository):
                 pass
             raise
 
-    def get_speakers(self, chat_id: int | None = None) -> list[Speaker]:
+    def get_speakers(self, chat_id: int | str | None = None) -> list[Speaker]:
         chat_key = self._chat_key(chat_id)
         with self._lock:
             return list(self._speakers_by_chat.get(chat_key, []))
 
-    def save_speaker(self, speaker: Speaker, chat_id: int | None = None) -> None:
+    def save_speaker(self, speaker: Speaker, chat_id: int | str | None = None) -> None:
         chat_key = self._chat_key(chat_id)
         key = normalize_speaker_key(speaker.name)
 
@@ -131,13 +131,13 @@ class JsonSpeakerRepository(SpeakerRepository):
             self._reindex_chat(chat_key)
             self._write_atomic()
 
-    def get_speaker(self, name: str, chat_id: int | None = None) -> Speaker | None:
+    def get_speaker(self, name: str, chat_id: int | str | None = None) -> Speaker | None:
         chat_key = self._chat_key(chat_id)
         key = normalize_speaker_key(name)
         with self._lock:
             return self._index_by_chat.get(chat_key, {}).get(key)
 
-    def rename_speaker(self, old_name: str, new_name: str, chat_id: int | None = None) -> Speaker | None:
+    def rename_speaker(self, old_name: str, new_name: str, chat_id: int | str | None = None) -> Speaker | None:
         chat_key = self._chat_key(chat_id)
         old_key = normalize_speaker_key(old_name)
         new_key = normalize_speaker_key(new_name)
